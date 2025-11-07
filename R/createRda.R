@@ -50,7 +50,7 @@ to.rds <- function(df, df_name = NULL, path = ".", skip_prompt = TRUE) { #defaul
   }
 
   # Check for user preferences file
-  user_prefs_file <- file.path(path, "..wizaRdry_prefs")
+  user_prefs_file <- file.path(path, ".wizaRdry_prefs")
   user_prefs <- list(shown_tree = FALSE, auto_create = FALSE, auto_clean = FALSE, auto_nda = FALSE,
                      auto_nda_template = FALSE, auto_csv = FALSE, auto_rds = FALSE)
 
@@ -119,16 +119,20 @@ to.rds <- function(df, df_name = NULL, path = ".", skip_prompt = TRUE) { #defaul
   return(invisible(TRUE))
 }
 
-#' Alias for 'to.rds'
+#' Alias for 'to.rds' (DEPRECATED)
 #'
+#' This function is deprecated. Please use 'to.rds' instead.
 #' This is a legacy alias for the 'to.rds' function to maintain compatibility with older code.
 #'
-#' @inheritParams to.rds
+#' @param ... Additional arguments passed through to \code{to.rds()}.
 #' @inherit to.rds return
 #' @export
 #' @examples
 #' \dontrun{
+#' # DEPRECATED - use to.rds() instead
 #' createRds(prl01)
 #' }
-createRds <- to.rds
-
+createRds <- function(...) {
+  .Deprecated("to.rds", package = "wizaRdry")
+  to.rds(...)
+}

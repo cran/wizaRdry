@@ -1,4 +1,4 @@
-# Modified ConfigEnv class with more flexible missing value categories
+# Modified ConfigEnv class with more flexible missing value categories and SQL support
 ConfigEnv <- R6::R6Class("ConfigEnv",
                          public = list(
                            # Store configuration
@@ -8,7 +8,7 @@ ConfigEnv <- R6::R6Class("ConfigEnv",
                            # Define validation specs for each API
                            api_specs = list(
                              mongo = list(
-                               required = c("collection")
+                               required = c("database")
                              ),
                              qualtrics = list(
                                required = c("survey_ids")
@@ -17,7 +17,7 @@ ConfigEnv <- R6::R6Class("ConfigEnv",
                                required = c("superkey", "primary_key")
                              ),
                              sql = list(
-                               required = c()  # Add required fields for SQL as needed
+                               required = c("database", "superkey", "primary_key", "pii_fields")
                              ),
                              missing_data_codes = list(
                                required = c(),  # No required fields - all are optional
@@ -32,7 +32,7 @@ ConfigEnv <- R6::R6Class("ConfigEnv",
                              )
                            ),
 
-                           initialize = function(config_file = "config.yml") {
+                            initialize = function(config_file = "config.yml") {
                              # Check if config file exists
                              if (!file.exists(config_file)) {
                                stop(config_file, " not found. Please create this file with the required API configurations.")
@@ -47,16 +47,26 @@ ConfigEnv <- R6::R6Class("ConfigEnv",
 
                            # Method to handle variable substitutions like ${study_alias}
                            process_substitutions = function() {
-                             # Process mongo collection name if it references study_alias
+                             # Process mongo database name if it references study_alias
                              if (!is.null(self$config$mongo) &&
-                                 !is.null(self$config$mongo$collection) &&
-                                 self$config$mongo$collection == "${study_alias}") {
+                                 !is.null(self$config$mongo$database) &&
+                                 self$config$mongo$database == "${study_alias}") {
                                if (!is.null(self$config$study_alias)) {
-                                 self$config$mongo$collection <- self$config$study_alias
+                                 self$config$mongo$database <- self$config$study_alias
                                } else {
-                                 warning("Cannot substitute ${study_alias} in mongo.collection: study_alias is not defined in config")
+                                 warning("Cannot substitute ${study_alias} in mongo.database: study_alias is not defined in config")
                                }
                              }
+                               # Process sql database name if it references study_alias
+                               if (!is.null(self$config$sql) &&
+                                   !is.null(self$config$sql$database) &&
+                                   self$config$sql$database == "${study_alias}") {
+                                 if (!is.null(self$config$study_alias)) {
+                                   self$config$sql$database <- self$config$study_alias
+                                 } else {
+                                   warning("Cannot substitute ${study_alias} in sql.database: study_alias is not defined in config")
+                                 }
+                               }
                              # Add more substitution rules as needed
                            },
 
@@ -145,9 +155,9 @@ ConfigEnv <- R6::R6Class("ConfigEnv",
                              }
                              # API-specific additional validations
                              if (api_type == "mongo") {
-                               # Check if collection is empty after substitution
-                               if (self$has_value("mongo.collection") && nchar(self$get_value("mongo.collection")) == 0) {
-                                 all_errors <- c(all_errors, "The 'collection' setting cannot be empty")
+                               # Check if database is empty after substitution
+                               if (self$has_value("mongo.database") && nchar(self$get_value("mongo.database")) == 0) {
+                                 all_errors <- c(all_errors, "The 'database' setting cannot be empty")
                                }
                              } else if (api_type == "qualtrics") {
                                # Check if survey_ids exists and is a list
@@ -170,8 +180,30 @@ ConfigEnv <- R6::R6Class("ConfigEnv",
                                if (self$has_value("redcap.primary_key") && nchar(self$get_value("redcap.primary_key")) == 0) {
                                  all_errors <- c(all_errors, "The 'primary_key' setting cannot be empty")
                                }
-                             } else if (api_type == "sql") {
-                               # Any sql-specific validations
+                            } else if (api_type == "sql") {
+                               # SQL-specific validations
+                              # Check for primary_key setting if specified
+                               if (self$has_value("sql.primary_key") && nchar(self$get_value("sql.primary_key")) == 0) {
+                                 all_errors <- c(all_errors, "The 'primary_key' setting cannot be empty")
+                               }
+
+                              # Check for superkey table if specified
+                               if (self$has_value("sql.superkey") && nchar(self$get_value("sql.superkey")) == 0) {
+                                 all_errors <- c(all_errors, "The 'superkey' setting cannot be empty")
+                               }
+
+                              # Check for pii_fields if specified
+                               if (self$has_value("sql.pii_fields")) {
+                                 pii_fields <- self$get_value("sql.pii_fields")
+                                 if (!is.vector(pii_fields) || !is.character(pii_fields)) {
+                                   all_errors <- c(all_errors, "The 'pii_fields' setting must be a character vector")
+                                 }
+                               }
+
+                              # Ensure at least one of database or schema exists when needed
+                              if (!self$has_value("sql.database") && !self$has_value("sql.schema")) {
+                                message("Note: Neither 'database' nor 'schema' specified under sql; some features may attempt auto-detection or require fully qualified names.")
+                              }
                              } else if (api_type == "missing_data_codes") {
                                # Get the current missing_data_codes configuration
                                missing_value_config <- self$get_value("missing_data_codes")

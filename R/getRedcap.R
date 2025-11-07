@@ -80,7 +80,7 @@ formatDuration <- function(duration) {
 #' @param batch_size Number of records to retrieve per batch
 #' @param records Optional vector of specific record IDs
 #' @param fields Optional vector of specific fields
-#' @param exclude_pii Default TRUE remove all fields marked as identifiable
+#' @param pii Logical; if FALSE (default), remove fields marked as PII. TRUE keeps PII.
 #' @param interview_date Optional; can be either:
 #'        - A date string in various formats (ISO, US, etc.) to filter data up to that date
 #'        - A boolean TRUE to return only rows with non-NA interview_date values
@@ -96,7 +96,7 @@ formatDuration <- function(duration) {
 #' }
 redcap <- function(instrument_name = NULL, ..., raw_or_label = "raw",
                    redcap_event_name = NULL, batch_size = 1000,
-                   records = NULL, fields = NULL, exclude_pii = TRUE,
+                   records = NULL, fields = NULL, pii = FALSE,
                    interview_date = NULL, date_format = "ymd", complete = NULL) {
   start_time <- Sys.time()
 
@@ -120,6 +120,7 @@ redcap <- function(instrument_name = NULL, ..., raw_or_label = "raw",
     "subjectkey",
     "site",
     "subsiteid",
+    "src_institution_id",
     "sex",
     "race",
     "ethnic_group",
@@ -134,7 +135,11 @@ redcap <- function(instrument_name = NULL, ..., raw_or_label = "raw",
     "family_study",
     "sample_taken",
     "visit",
-    "week"
+    "week",
+    "interview_age",
+    "group_status",
+    "int_start",
+    "int_end"
   )
 
   # Validate date_format parameter
@@ -145,6 +150,36 @@ redcap <- function(instrument_name = NULL, ..., raw_or_label = "raw",
   # Get secrets using get_secret() to keep it secret, keep it safe
   uri <- get_secret("uri")
   token <- get_secret("token")
+
+  # Test to see if API connection is working
+  message("Validating REDCap API connection and user permissions...")
+  api_test <- tryCatch({
+    # Use a call to redcap_instruments to see if API connnection is working
+    forms_test <- REDCapR::redcap_instruments(redcap_uri = uri, token = token, verbose = FALSE)
+
+    # Add conditions to see if API connection is working, if not, throw an error
+    if (!is.null(forms_test$success) && !forms_test$success) {
+      stop("API connection failed - check your user permissions")
+    }
+
+    if (is.null(forms_test$data) || nrow(forms_test$data) == 0) {
+      stop("API connected but no instruments accessible - check your export permissions")
+    }
+
+    # If permissions are correct and everything is working, notify the user
+    message("\nREDCap API connection and permissions validated successfully\n")
+    TRUE
+
+    # If permissions are not correct, throw an error with message
+  }, error = function(e) {
+    stop(sprintf(paste(
+      "REDCap API validation failed: \n",
+      "Please verify:\n",
+      "1. Your REDCap user has 'API Export' and 'API Import/Update' rights\n",
+      "2. The API module is enabled for your REDCap project\n",
+      "3. Your API token and URI are correct in your secrets configuration"
+    )), call. = FALSE)
+  })
 
   # Input validation
   if (is.null(instrument_name)) {
@@ -186,6 +221,12 @@ redcap <- function(instrument_name = NULL, ..., raw_or_label = "raw",
     }
   })
 
+  # Determine if the requested instrument is the configured superkey form
+  is_superkey_request <- FALSE
+  if (!is.null(config$redcap$superkey)) {
+    is_superkey_request <- identical(trimws(instrument_name), trimws(config$redcap$superkey))
+  }
+
   # First get metadata to identify PII fields
   metadata <- NULL
   pii_fields <- c()
@@ -216,7 +257,7 @@ redcap <- function(instrument_name = NULL, ..., raw_or_label = "raw",
     }
   }
 
-  if (exclude_pii && !is.null(metadata) && "field_name" %in% names(metadata) && "identifier" %in% names(metadata)) {
+  if (!pii && !is.null(metadata) && "field_name" %in% names(metadata) && "identifier" %in% names(metadata)) {
     pii_fields <- metadata$field_name[metadata$identifier == "y"]
     # Filter out NA values and print only the non-NA field names
     pii_fields <- pii_fields[!is.na(pii_fields)]
@@ -229,7 +270,7 @@ redcap <- function(instrument_name = NULL, ..., raw_or_label = "raw",
 
   # Now decide which fields to request based on the PII exclusion
   selected_fields <- NULL
-  if (exclude_pii && length(pii_fields) > 0) {
+  if (!pii && length(pii_fields) > 0) {
     # If fields parameter is provided, exclude PII fields from it
     if (!is.null(fields)) {
       selected_fields <- setdiff(fields, pii_fields)
@@ -253,7 +294,7 @@ redcap <- function(instrument_name = NULL, ..., raw_or_label = "raw",
                   ifelse(!is.null(redcap_event_name),
                          sprintf(" %s", redcap_event_name),
                          ""),
-                  ifelse(exclude_pii && length(pii_fields) > 0, " (excluding PII)", "")))
+                 ifelse(!pii && length(pii_fields) > 0, " (excluding PII)", "")))
   for (i in 1:20) {
     updateLoadingAnimation(pb, i)
     Sys.sleep(0.1)
@@ -296,12 +337,15 @@ redcap <- function(instrument_name = NULL, ..., raw_or_label = "raw",
   }
 
   # If excluding PII, remove PII fields from superkey columns
-  if (exclude_pii && length(pii_fields) > 0) {
+  if (!pii && length(pii_fields) > 0) {
     super_key_cols <- setdiff(super_key_cols, pii_fields)
   }
 
-  # 3. Process superkey data to ensure it's available for all subjects regardless of event
-  if ("redcap_event_name" %in% names(superkey_response$data)) {
+  # If the requested instrument IS the superkey, return it directly without joins/propagation
+  if (is_superkey_request) {
+    message("Requested instrument matches configured superkey; returning without joins or propagation.")
+    df <- instrument_response$data
+  } else if ("redcap_event_name" %in% names(superkey_response$data)) {
     # First, ensure the primary key exists in the superkey data
     if (!(config$redcap$primary_key %in% names(superkey_response$data))) {
       stop(sprintf("Primary key '%s' not found in superkey data", config$redcap$primary_key))
@@ -339,7 +383,7 @@ redcap <- function(instrument_name = NULL, ..., raw_or_label = "raw",
         }
       }
     }
-  } else {
+  } else if (!is_superkey_request) {
     # If no redcap_event_name, just use the superkey data as is, but only the allowed columns
     allowed_cols <- intersect(names(superkey_response$data), super_key_cols)
 
@@ -352,14 +396,14 @@ redcap <- function(instrument_name = NULL, ..., raw_or_label = "raw",
   }
 
   # FIXED: Merge the consolidated superkey with the instrument data
-  # Check for empty data frames first
-  if (nrow(consolidated_superkey) == 0) {
+  # If superkey requested, we already set df above; otherwise proceed with merge logic
+  if (!exists("df", inherits = FALSE) && nrow(consolidated_superkey) == 0) {
     message("Warning: Consolidated superkey is empty. Using instrument data as is.")
     df <- instrument_response$data
-  } else if (nrow(instrument_response$data) == 0) {
+  } else if (!exists("df", inherits = FALSE) && nrow(instrument_response$data) == 0) {
     message("Warning: Instrument data is empty. Using consolidated superkey as is.")
     df <- consolidated_superkey
-  } else if ("redcap_event_name" %in% names(instrument_response$data)) {
+  } else if (!exists("df", inherits = FALSE) && "redcap_event_name" %in% names(instrument_response$data)) {
     # Keep the original event names from the instrument data
     df <- instrument_response$data
 
@@ -392,7 +436,7 @@ redcap <- function(instrument_name = NULL, ..., raw_or_label = "raw",
         }
       }
     }
-  } else {
+  } else if (!exists("df", inherits = FALSE)) {
     # Standard merge if there's no event name in the instrument data
     message("Performing standard merge of superkey and instrument data")
     # Make sure at least the primary key is in both data frames
@@ -547,7 +591,7 @@ redcap <- function(instrument_name = NULL, ..., raw_or_label = "raw",
   }
 
   # Make a final pass to remove any PII fields that might have been included
-  if (exclude_pii && length(pii_fields) > 0) {
+  if (!pii && length(pii_fields) > 0) {
     pii_cols_present <- intersect(names(df), pii_fields)
     pii_cols_present <- pii_cols_present[!is.na(pii_cols_present)]
     if (length(pii_cols_present) > 0) {
@@ -673,7 +717,7 @@ redcap <- function(instrument_name = NULL, ..., raw_or_label = "raw",
           message("Filtering for complete records only...")
           # Handle both raw (1) and label ("Complete") formats
           if (raw_or_label == "raw") {
-            df <- df[df[[complete_var]] == 1, ]
+            df <- df[df[[complete_var]] == 2, ]
           } else {
             df <- df[df[[complete_var]] == "Complete", ]
           }
@@ -910,8 +954,9 @@ redcap.dict <- function(instrument_name) {
   stop("Input must be either a data frame, a string variable name, or an instrument name string.")
 }
 
-#' Alias for 'redcap'
+#' Alias for 'redcap' (DEPRECATED)
 #'
+#' This function is deprecated. Please use 'redcap' instead.
 #' This is a legacy alias for the 'redcap' function to maintain compatibility with older code.
 #'
 #' @inheritParams redcap
@@ -919,7 +964,10 @@ redcap.dict <- function(instrument_name) {
 #' @export
 #' @examples
 #' \dontrun{
+#' # DEPRECATED - use redcap() instead
 #' survey_data <- getRedcap("demographics")
 #' }
-getRedcap <- redcap
-
+getRedcap <- function(...) {
+  .Deprecated("redcap", package = "wizaRdry")
+  redcap(...)
+}

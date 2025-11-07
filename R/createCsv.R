@@ -51,7 +51,7 @@ to.csv <- function(df, df_name = NULL, path = ".", skip_prompt = TRUE) { # set d
   }
 
   # Check for user preferences file
-  user_prefs_file <- file.path(path, "..wizaRdry_prefs")
+  user_prefs_file <- file.path(path, ".wizaRdry_prefs")
   user_prefs <- list(shown_tree = FALSE, auto_create = FALSE, auto_clean = FALSE, auto_nda = FALSE, auto_csv = FALSE)
 
   if (file.exists(user_prefs_file)) {
@@ -113,16 +113,20 @@ to.csv <- function(df, df_name = NULL, path = ".", skip_prompt = TRUE) { # set d
   return(invisible(TRUE))
 }
 
-#' Alias for 'to.csv'
+#' Alias for 'to.csv' (DEPRECATED)
 #'
+#' This function is deprecated. Please use 'to.csv' instead.
 #' This is a legacy alias for the 'to.csv' function to maintain compatibility with older code.
 #'
-#' @inheritParams to.csv
+#' @param ... Additional arguments passed through to \code{to.csv()}.
 #' @inherit to.csv return
 #' @export
 #' @examples
 #' \dontrun{
+#' # DEPRECATED - use to.csv() instead
 #' createCsv(prl01)
 #' }
-createCsv <- to.csv
-
+createCsv <- function(...) {
+  .Deprecated("to.csv", package = "wizaRdry")
+  to.csv(...)
+}

@@ -11,7 +11,7 @@ safe_readline <- function(prompt, default = "", allow_exit = TRUE) {
     readline(prompt)
   }, interrupt = function(i) { # Interrupt handling. This part only gets called if Ctrl + C is pressed
     if (allow_exit) {
-      message("\nOperation cancelled by user. Exiting...")
+      message("\nOperation canceled by user. Exiting...")
       invokeRestart("abort") # At this point, the abort should cause nda() to exit at the highest level
     } else {
       message("\nInterrupt received. Using default value.")
@@ -31,6 +31,267 @@ safe_readline <- function(prompt, default = "", allow_exit = TRUE) {
   }
 
   return(result)
+}
+# STEP 1: Add these 3 functions to your code (before ndaValidator function)
+
+# Enhanced parse_array_string function to handle your specific array formats
+parse_array_string <- function(value) {
+  if (is.null(value) || is.na(value)) return(NULL)
+
+  # Handle string arrays with brackets
+  if (is.character(value) && length(value) == 1) {
+    # Remove brackets and unicode prefixes
+    clean_str <- gsub("^\\[|\\]$", "", value)  # Remove outer brackets
+    clean_str <- gsub("u'|'|\"", "", clean_str)  # Remove unicode prefixes and quotes
+
+    # Split by comma and clean up
+    values <- strsplit(clean_str, ",\\s*")[[1]]
+    values <- trimws(values)
+
+    # Remove empty values
+    values <- values[values != ""]
+
+    return(values)
+  }
+
+  # Handle numeric arrays
+  if (is.numeric(value) && length(value) > 1) {
+    return(sprintf("%.1f", value))
+  }
+
+  return(as.character(value))
+}
+
+# Enhanced function to detect and handle array-like fields
+detect_array_fields <- function(df, elements, verbose = TRUE) {
+  array_fields <- list()
+
+  for (i in 1:nrow(elements)) {
+    field_name <- elements$name[i]
+    type <- elements$type[i]
+    value_range <- elements$valueRange[i]
+    notes <- elements$notes[i]
+
+    # Skip if field doesn't exist
+    if (!field_name %in% names(df)) next
+
+    field_values <- df[[field_name]]
+
+    # Check if values look like arrays
+    if (is.character(field_values)) {
+      # Look for bracket notation
+      has_brackets <- any(grepl("^\\[.*\\]$", field_values), na.rm = TRUE)
+
+      if (has_brackets) {
+        # Parse a sample to understand the data structure
+        sample_values <- field_values[!is.na(field_values) & grepl("^\\[.*\\]$", field_values)]
+        if (length(sample_values) > 0) {
+          parsed_sample <- parse_array_string(sample_values[1])
+
+          array_fields[[field_name]] <- list(
+            type = type,
+            value_range = value_range,
+            notes = notes,
+            sample_parsed = parsed_sample,
+            array_type = if (all(suppressWarnings(!is.na(as.numeric(parsed_sample))))) "numeric" else "text"
+          )
+
+          if (verbose) {
+            cat(sprintf("\nDetected array field: %s", field_name))
+            cat(sprintf("\n  Expected type: %s", type))
+            cat(sprintf("\n  Array type: %s", array_fields[[field_name]]$array_type))
+            cat(sprintf("\n  Sample parsed: %s", paste(parsed_sample, collapse=", ")))
+            cat(sprintf("\n  Expected range: %s", value_range))
+          }
+        }
+      }
+    }
+  }
+
+  return(array_fields)
+}
+
+# Enhanced function to convert array fields to appropriate numeric codes
+convert_array_fields <- function(df, elements, verbose = TRUE) {
+  if (verbose) cat("\n\n--- Converting Array Fields ---\n")
+
+  # Detect array fields
+  array_fields <- detect_array_fields(df, elements, verbose = verbose)
+
+  if (length(array_fields) == 0) {
+    if (verbose) cat("No array fields detected.\n")
+    return(df)
+  }
+
+  conversions_made <- list()
+
+  for (field_name in names(array_fields)) {
+    field_info <- array_fields[[field_name]]
+    field_values <- df[[field_name]]
+
+    if (verbose) {
+      cat(sprintf("\n\nProcessing array field: %s", field_name))
+      cat(sprintf("\n  Target type: %s", field_info$type))
+      cat(sprintf("\n  Expected range: %s", field_info$value_range))
+    }
+
+    # Strategy 1: Try to extract mappings from notes
+    mapping <- NULL
+    if (!is.null(field_info$notes) && !is.na(field_info$notes)) {
+      # Look for array notation in notes like "1=[0.9, 0.5, 0.1]" or "1=(Left, Middle, Right)"
+      array_pattern <- "(\\d+)\\s*=\\s*[\\(\\[]([^\\)\\]]+)[\\)\\]]"
+      matches <- gregexpr(array_pattern, field_info$notes, perl = TRUE)
+
+      if (matches[[1]][1] != -1) {
+        mapping <- list()
+        all_matches <- regmatches(field_info$notes, matches)[[1]]
+
+        for (match in all_matches) {
+          parts <- regexec(array_pattern, match, perl = TRUE)
+          extracted <- regmatches(match, parts)[[1]]
+
+          if (length(extracted) >= 3) {
+            code <- extracted[2]
+            array_content <- extracted[3]
+
+            # Clean up the array content and normalize case
+            clean_content <- gsub("'|\"", "", array_content)
+            array_values <- trimws(strsplit(clean_content, ",")[[1]])
+
+            # Create a signature for this array (normalize to lowercase and sort)
+            array_signature <- paste(sort(tolower(array_values)), collapse=",")
+            mapping[[array_signature]] <- code
+          }
+        }
+
+        if (verbose && length(mapping) > 0) {
+          cat("\n  Found array mappings in notes:")
+          for (sig in names(mapping)) {
+            cat(sprintf("\n    [%s] -> %s", sig, mapping[[sig]]))
+          }
+        }
+      }
+    }
+
+    # Strategy 2: If no mapping found, create position-based mapping
+    if (is.null(mapping) || length(mapping) == 0) {
+      # Get unique arrays and assign codes based on value range
+      unique_arrays <- unique(field_values[!is.na(field_values)])
+
+      if (field_info$type %in% c("Integer", "Float")) {
+        # Get valid codes from value range
+        valid_codes <- NULL
+
+        if (!is.null(field_info$value_range) && !is.na(field_info$value_range)) {
+          if (grepl("::", field_info$value_range)) {
+            # Range notation
+            range_parts <- strsplit(field_info$value_range, "::")[[1]]
+            valid_codes <- seq(from = as.numeric(range_parts[1]),
+                               to = as.numeric(range_parts[2]))
+          } else if (grepl(";", field_info$value_range)) {
+            # Discrete values
+            valid_codes <- as.numeric(strsplit(field_info$value_range, ";")[[1]])
+          }
+        }
+
+        # Special handling for single value ranges with multi-element arrays
+        if (!is.null(valid_codes) && length(valid_codes) == 1 && length(unique_arrays) > 0) {
+          # If range is just "1" but we have arrays, expand the range based on array content
+          sample_array <- parse_array_string(unique_arrays[1])
+          if (!is.null(sample_array) && length(sample_array) > 1) {
+            # Create a range from 1 to length of array elements
+            valid_codes <- seq(1, length(sample_array))
+            if (verbose) {
+              cat(sprintf("\n  Expanded range from %s to 1::%d based on array length",
+                          field_info$value_range, length(sample_array)))
+            }
+          }
+        }
+
+        if (!is.null(valid_codes) && length(unique_arrays) <= length(valid_codes)) {
+          mapping <- list()
+          for (i in 1:length(unique_arrays)) {
+            array_val <- unique_arrays[i]
+            # Parse the array to create a signature
+            parsed_array <- parse_array_string(array_val)
+            if (!is.null(parsed_array)) {
+              # Normalize case and sort for consistent signature
+              array_signature <- paste(sort(tolower(parsed_array)), collapse=",")
+              mapping[[array_signature]] <- as.character(valid_codes[i])
+            }
+          }
+
+          if (verbose && length(mapping) > 0) {
+            cat("\n  Created position-based mapping:")
+            for (sig in names(mapping)) {
+              cat(sprintf("\n    [%s] -> %s", sig, mapping[[sig]]))
+            }
+          }
+        }
+      }
+    }
+
+    # Apply the mapping
+    if (!is.null(mapping) && length(mapping) > 0) {
+      new_values <- field_values
+      conversion_count <- 0
+
+      for (i in 1:length(field_values)) {
+        if (!is.na(field_values[i])) {
+          parsed_array <- parse_array_string(field_values[i])
+          if (!is.null(parsed_array)) {
+            # Normalize case and sort for consistent signature matching
+            array_signature <- paste(sort(tolower(parsed_array)), collapse=",")
+
+            if (array_signature %in% names(mapping)) {
+              new_values[i] <- mapping[[array_signature]]
+              conversion_count <- conversion_count + 1
+            }
+          }
+        }
+      }
+
+      if (conversion_count > 0) {
+        # Apply type conversion
+        if (field_info$type == "Integer") {
+          df[[field_name]] <- as.integer(new_values)
+        } else if (field_info$type == "Float") {
+          df[[field_name]] <- as.numeric(new_values)
+        } else {
+          df[[field_name]] <- new_values
+        }
+
+        conversions_made[[field_name]] <- list(
+          converted_count = conversion_count,
+          mapping = mapping
+        )
+
+        if (verbose) {
+          cat(sprintf("\n  SUCCESS: Converted %d array values to numeric codes", conversion_count))
+        }
+      } else {
+        if (verbose) {
+          cat("\n  FAILED: Could not convert array values")
+        }
+      }
+    } else {
+      if (verbose) {
+        cat("\n  FAILED: No mapping strategy worked")
+      }
+    }
+  }
+
+  # Summary
+  if (verbose && length(conversions_made) > 0) {
+    cat("\n\nArray Conversion Summary:")
+    for (field in names(conversions_made)) {
+      cat(sprintf("\n- %s: %d values converted",
+                  field, conversions_made[[field]]$converted_count))
+    }
+    cat("\n")
+  }
+
+  return(df)
 }
 
 # Function to handle missing required fields
@@ -449,6 +710,19 @@ fix_na_values <- function(df, elements, verbose = FALSE, config_file = "./config
 # Improved conversion that preserves original values and only converts actual missing data
 apply_type_conversions <- function(df, elements, verbose = FALSE) {
   if(verbose) cat("\nApplying type conversions...")
+
+  # First, convert all empty strings to NA in character columns
+  for (col in names(df)) {
+    if (is.character(df[[col]])) {
+      empty_count <- sum(df[[col]] == "", na.rm = TRUE)
+      if (empty_count > 0 && verbose) {
+        cat(sprintf("\n\nField: %s", col))
+        cat(sprintf("\n  Converting %d empty strings to NA", empty_count))
+      }
+      df[[col]][df[[col]] == ""] <- NA
+    }
+  }
+
   conversion_summary <- list()
 
   for (i in 1:nrow(elements)) {
@@ -763,8 +1037,152 @@ standardize_age <- function(df, verbose = TRUE, limited_dataset = limited_datase
   return(df)
 }
 
+# Calculate Jaro-Winkler similarity between two strings
+calculate_jaro_winkler <- function(str1, str2) {
+  # Convert to lowercase for comparison
+  str1 <- tolower(str1)
+  str2 <- tolower(str2)
+
+  # Handle exact matches first
+  if (str1 == str2) return(1.0)
+  if (nchar(str1) == 0 || nchar(str2) == 0) return(0.0)
+
+  # Parse structure names for scientific patterns
+  parse_nda_name <- function(name) {
+    # Remove version numbers (01, 02, etc.)
+    base <- gsub("\\d+$", "", name)
+    # Split on underscores
+    parts <- unlist(strsplit(base, "[_-]"))
+
+    list(
+      base = base,
+      parts = parts,
+      has_suffix = grepl("\\d+$", name),
+      suffix = if(grepl("\\d+$", name)) gsub(".*?(\\d+)$", "\\1", name) else ""
+    )
+  }
+
+  comp1 <- parse_nda_name(str1)
+  comp2 <- parse_nda_name(str2)
+
+  # Jaro-Winkler similarity algorithm implementation
+  jaro_winkler <- function(s1, s2, prefix_weight = 0.1) {
+    if (s1 == s2) return(1.0)
+    if (nchar(s1) == 0 || nchar(s2) == 0) return(0.0)
+
+    len1 <- nchar(s1)
+    len2 <- nchar(s2)
+
+    # Calculate match window
+    match_window <- floor(max(len1, len2) / 2) - 1
+    if (match_window < 0) match_window <- 0
+
+    # Track matches
+    s1_matches <- rep(FALSE, len1)
+    s2_matches <- rep(FALSE, len2)
+    matches <- 0
+    transpositions <- 0
+
+    # Find matches within the window
+    for (i in 1:len1) {
+      start <- max(1, i - match_window)
+      end <- min(len2, i + match_window)
+
+      for (j in start:end) {
+        if (s2_matches[j] || substr(s1, i, i) != substr(s2, j, j)) next
+        s1_matches[i] <- TRUE
+        s2_matches[j] <- TRUE
+        matches <- matches + 1
+        break
+      }
+    }
+
+    if (matches == 0) return(0.0)
+
+    # Count transpositions
+    k <- 1
+    for (i in 1:len1) {
+      if (!s1_matches[i]) next
+      while (!s2_matches[k]) k <- k + 1
+      if (substr(s1, i, i) != substr(s2, k, k)) transpositions <- transpositions + 1
+      k <- k + 1
+    }
+
+    # Calculate Jaro similarity
+    jaro <- (matches/len1 + matches/len2 + (matches - transpositions/2)/matches) / 3
+
+    # Add Winkler prefix bonus
+    prefix_length <- 0
+    max_prefix <- min(len1, len2, 4)
+    for (i in 1:max_prefix) {
+      if (substr(s1, i, i) == substr(s2, i, i)) {
+        prefix_length <- prefix_length + 1
+      } else {
+        break
+      }
+    }
+
+    return(jaro + (prefix_weight * prefix_length * (1 - jaro)))
+  }
+
+  # Start with Jaro-Winkler base similarity
+  base_score <- jaro_winkler(str1, str2)
+
+  # Scientific naming bonuses
+  bonuses <- 0
+
+  # 1. Substring containment bonus (e.g., "fomo" in "fomo01")
+  if (nchar(comp1$base) > 0 && nchar(comp2$base) > 0) {
+    if (grepl(comp1$base, comp2$base, fixed = TRUE) || grepl(comp2$base, comp1$base, fixed = TRUE)) {
+      shorter_len <- min(nchar(comp1$base), nchar(comp2$base))
+      longer_len <- max(nchar(comp1$base), nchar(comp2$base))
+      bonuses <- bonuses + (shorter_len / longer_len) * 0.15  # Reduced from 0.25
+    }
+  }
+
+  # 2. Version number bonus (both have numbers, or one is subset of other)
+  if (comp1$has_suffix && comp2$has_suffix) {
+    if (comp1$suffix == comp2$suffix) {
+      bonuses <- bonuses + 0.08  # Reduced from 0.15
+    }
+  } else if (comp1$has_suffix || comp2$has_suffix) {
+    # One has version, one doesn't - check if base names match
+    base1 <- comp1$base
+    base2 <- comp2$base
+    if (base1 == base2 || base1 == str2 || base2 == str1) {
+      bonuses <- bonuses + 0.12  # Reduced from 0.2
+    }
+  }
+
+  # 3. Common scientific abbreviations
+  scientific_abbrevs <- list(
+    demo = c("demographic", "demographics"),
+    behav = c("behavioral", "behaviour", "behavior"),
+    cog = c("cognitive", "cognition"),
+    psych = c("psychological", "psychology"),
+    neuro = c("neurological", "neuroscience"),
+    clin = c("clinical"),
+    fam = c("family", "familial")
+  )
+
+  # Check if either string is an abbreviation of the other
+  for (abbrev in names(scientific_abbrevs)) {
+    full_terms <- scientific_abbrevs[[abbrev]]
+    if ((str1 == abbrev && any(sapply(full_terms, function(x) grepl(x, str2)))) ||
+        (str2 == abbrev && any(sapply(full_terms, function(x) grepl(x, str1))))) {
+      bonuses <- bonuses + 0.2  # Reduced from 0.3
+      break
+    }
+  }
+
+  # Combine base score with bonuses, cap at 1.0
+  final_score <- min(1.0, base_score + bonuses)
+
+  return(final_score)
+}
+
 # Calculate Levenshtein distance similarity between two strings
-calculate_similarity <- function(str1, str2) {
+calculate_levenshtein <- function(str1, str2) {
   # Convert to lowercase
   str1 <- tolower(str1)
   str2 <- tolower(str2)
@@ -969,16 +1387,18 @@ find_and_rename_fields <- function(df, elements, structure_name, measure_name, a
       # Calculate similarity scores
       similarities <- sapply(valid_fields, function(name) {
         # Calculate direct similarity
-        calculate_similarity(field, name)
+        calculate_levenshtein(field, name)
       })
 
       # Store all similarity scores
       renamed$similarity_scores[[field]] <- sort(similarities, decreasing = TRUE)
 
-      if(verbose) {
+      if(verbose && !interactive_mode) {
         cat(sprintf("\nField: %s\n", field))
         cat("Top matches:\n")
-        top_matches <- head(sort(similarities, decreasing = TRUE), 5)
+        # Get all matches sorted by similarity
+        all_matches <- sort(similarities, decreasing = TRUE)
+        top_matches <- head(all_matches, 5)  # Keep original logic for high confidence
         for(i in seq_along(top_matches)) {
           cat(sprintf("%d. %s (%.2f%% match)\n",
                       i,
@@ -997,17 +1417,76 @@ find_and_rename_fields <- function(df, elements, structure_name, measure_name, a
           rename_field <- TRUE
           if(interactive_mode) {
             rename_input <- safe_readline(
-              prompt = sprintf("Rename '%s' to '%s' (similarity: %.2f%%)? (y/n): ",
+              prompt = sprintf("Rename '%s' to '%s' (similarity: %.2f%%)? (y/n/m for manual): ",
                                field, best_match, best_score * 100),
               default = "y"
             )
             # Check to make sure the input is a valid response
-            while (!tolower(rename_input) %in% c("y", "n")){
-              rename_input <- readline(prompt = "Please enter either y or n: ")
+            while (!tolower(rename_input) %in% c("y", "n", "m")){
+              rename_input <- readline(prompt = "Please enter y, n, or m for manual entry: ")
             }
-            rename_field <- tolower(rename_input) %in% c("y", "yes")
+            
+            if(tolower(rename_input) == "m") {
+              # User wants to enter a field name manually
+              manual_input <- safe_readline(
+                prompt = sprintf("Enter the NDA field name for '%s': ", field),
+                default = ""
+              )
+              # Validate that the manual input is not empty
+              while(manual_input == "" || is.na(manual_input)) {
+                manual_input <- safe_readline(
+                  prompt = sprintf("Please enter a valid field name for '%s': ", field),
+                  default = ""
+                )
+              }
+              best_match <- manual_input
+              rename_field <- TRUE
+              if(verbose) {
+                cat(sprintf("Using manual field name: '%s'\n", best_match))
+              }
+            } else {
+              rename_field <- tolower(rename_input) %in% c("y", "yes")
+            }
           }
 
+          # Check value range compatibility before renaming
+          if(rename_field) {
+            # Get value ranges for both fields
+            source_range <- get_field_value_range(field, elements)
+            target_range <- get_field_value_range(best_match, elements)
+            
+            # Check if value ranges are compatible
+            range_check <- check_value_range_compatibility(source_range, target_range, field, best_match, verbose)
+            
+            if(!range_check$compatible) {
+              if(verbose) {
+                cat(sprintf("\n***  VALUE RANGE CONFLICT DETECTED:\n"))
+                cat(sprintf("   Source field '%s' range: %s\n", field, source_range))
+                cat(sprintf("   Target field '%s' range: %s\n", best_match, target_range))
+                cat(sprintf("   %s\n", range_check$message))
+                cat(sprintf("   Recommendation: %s\n", range_check$recommendation))
+              }
+              
+              # Ask user if they want to proceed despite the conflict
+              if(interactive_mode) {
+                proceed_input <- safe_readline(
+                  prompt = sprintf("Proceed with rename despite value range conflict? (y/n): "),
+                  default = "n"
+                )
+                while (!tolower(proceed_input) %in% c("y", "n")){
+                  proceed_input <- readline(prompt = "Please enter either y or n: ")
+                }
+                rename_field <- tolower(proceed_input) %in% c("y", "yes")
+              } else {
+                # In non-interactive mode, skip the rename if there's a conflict
+                rename_field <- FALSE
+                if(verbose) {
+                  cat("Skipping rename due to value range conflict (non-interactive mode)\n")
+                }
+              }
+            }
+          }
+          
           if(rename_field) {
             if(verbose) {
               message(sprintf("\nRENAMING: '%s' to '%s' (similarity: %.2f%%)\n",
@@ -1047,40 +1526,168 @@ find_and_rename_fields <- function(df, elements, structure_name, measure_name, a
           if(verbose) {
             cat(sprintf("No automatic rename - best match below 90%% threshold\n"))
           }
-          # Present top 5 matches as options
-          top_matches <- head(sort(similarities, decreasing = TRUE), 5)
+          # Present paginated matches as options
+          all_matches <- sort(similarities, decreasing = TRUE)
           selected_match <- NULL
           if(interactive_mode) {
-            rename_input <- safe_readline(
-              prompt = sprintf("Select match for '%s' (1-5 to select, or press Enter to skip): ", field),
-              default = "0"
-            )
-            # First check that the input is valid
-            while (!grepl("^[0-5]$",rename_input)){
-              rename_input <- safe_readline(prompt = 'Please enter a number 1-5 or press Enter to skip: ', default='0')
-            }
-            # Check if input is a number between 1-5
-            if(grepl("^[1-5]$", rename_input)) {
-              match_idx <- as.integer(rename_input)
-              if(match_idx <= length(top_matches)) {
-                selected_match <- names(top_matches)[match_idx]
+            # Interactive pagination for field matches
+            page_size <- 5
+            total <- length(all_matches)
+            page <- 1
+            
+            repeat {
+              start_idx <- (page - 1) * page_size + 1
+              end_idx <- min(page * page_size, total)
+              
+              cat(sprintf("\nField: %s\n", field))
+              cat(sprintf("Top matches %d-%d of %d:\n", start_idx, end_idx, total))
+              for (i in seq(start_idx, end_idx)) {
+                local_num <- i - start_idx + 1
+                match_name <- names(all_matches)[i]
+                match_score <- all_matches[i]
+                cat(sprintf("%d. %s (%.2f%% match)\n", local_num, match_name, match_score * 100))
               }
+              
+              prompt_msg <- sprintf("Select 1-5, 'n' next, 'p' prev, 'm' manual, Enter skip, Esc quit: ")
+              rename_input <- tryCatch({
+                safe_readline(prompt = prompt_msg, default = "")
+              }, interrupt = function(e) {
+                message("Interactive selection cancelled (Esc pressed). Skipping field.")
+                ""  # Treat as skip
+              })
+              
+              # Skip if empty or just whitespace
+              if (is.null(rename_input) || rename_input == "" || trimws(rename_input) == "") {
+                break
+              }
+              
+              # Manual entry
+              if (tolower(rename_input) == "m") {
+                manual_input <- safe_readline(
+                  prompt = sprintf("Enter the NDA field name for '%s': ", field),
+                  default = ""
+                )
+                # Validate that the manual input is not empty
+                while(manual_input == "" || is.na(manual_input)) {
+                  manual_input <- safe_readline(
+                    prompt = sprintf("Please enter a valid field name for '%s': ", field),
+                    default = ""
+                  )
+                }
+                selected_match <- manual_input
+                if(verbose) {
+                  cat(sprintf("Using manual field name: '%s'\n", selected_match))
+                }
+                break
+              }
+              
+              # Next/Prev navigation
+              if (tolower(rename_input) == "n") {
+                if (page * page_size < total) {
+                  page <- page + 1
+                } else {
+                  message("Already at last page.")
+                }
+                next
+              }
+              
+              if (tolower(rename_input) == "p") {
+                if (page > 1) {
+                  page <- page - 1
+                } else {
+                  message("Already at first page.")
+                }
+                next
+              }
+              
+              # Number selection
+              if (grepl("^[1-5]$", rename_input)) {
+                match_idx <- as.integer(rename_input)
+                if (match_idx >= 1 && match_idx <= (end_idx - start_idx + 1)) {
+                  global_index <- start_idx + match_idx - 1
+                  selected_match <- names(all_matches)[global_index]
+                  if(verbose) {
+                    cat(sprintf("Selected: %s (%.2f%% match)\n", selected_match, all_matches[global_index] * 100))
+                  }
+                  break
+                } else {
+                  message(sprintf("Please enter a number between 1 and %d", (end_idx - start_idx + 1)))
+                  next
+                }
+              }
+              
+              message("Invalid input. Choose 1-5, 'n', 'p', 'm', or Enter.")
             }
 
             # If user selected a match
             if(!is.null(selected_match)) {
-              if(verbose) {
-                message(sprintf("\nRENAMING: '%s' to '%s' (similarity: %.2f%%)\n",
-                                field, selected_match, top_matches[match_idx] * 100))
+              # Check value range compatibility before renaming
+              source_range <- get_field_value_range(field, elements)
+              target_range <- get_field_value_range(selected_match, elements)
+              
+              # Check if value ranges are compatible
+              range_check <- check_value_range_compatibility(source_range, target_range, field, selected_match, verbose)
+              
+              if(!range_check$compatible) {
+                if(verbose) {
+                  cat(sprintf("\n***  VALUE RANGE CONFLICT DETECTED:\n"))
+                  cat(sprintf("   Source field '%s' range: %s\n", field, source_range))
+                  cat(sprintf("   Target field '%s' range: %s\n", selected_match, target_range))
+                  cat(sprintf("   %s\n", range_check$message))
+                  cat(sprintf("   Recommendation: %s\n", range_check$recommendation))
+                }
+                
+                # Ask user if they want to proceed despite the conflict
+                if(interactive_mode) {
+                  proceed_input <- safe_readline(
+                    prompt = sprintf("Proceed with rename despite value range conflict? (y/n): "),
+                    default = "n"
+                  )
+                  while (!tolower(proceed_input) %in% c("y", "n")){
+                    proceed_input <- readline(prompt = "Please enter either y or n: ")
+                  }
+                  if(tolower(proceed_input) %in% c("y", "yes")) {
+                    # Proceed with rename
+                    if(verbose) {
+                      message(sprintf("\nRENAMING: '%s' to '%s' (similarity: %.2f%%)\n",
+                                      field, selected_match, all_matches[selected_match] * 100))
+                    }
+                    field_data <- df[[field]]
+                    df[[selected_match]] <- field_data
+                    # Track rename
+                    renamed$renamed_fields <- c(renamed$renamed_fields, field)
+                    renamed$renames <- c(renamed$renames,
+                                         sprintf("%s -> %s (%.2f%%)",
+                                                 field, selected_match, all_matches[selected_match] * 100))
+                  } else {
+                    # Skip rename due to conflict
+                    if(verbose) {
+                      cat("Skipping rename due to value range conflict\n")
+                    }
+                    selected_match <- NULL  # Reset to trigger drop/keep logic
+                  }
+                } else {
+                  # In non-interactive mode, skip the rename if there's a conflict
+                  if(verbose) {
+                    cat("Skipping rename due to value range conflict (non-interactive mode)\n")
+                  }
+                  selected_match <- NULL  # Reset to trigger drop/keep logic
+                }
+              } else {
+                # Value ranges are compatible, proceed with rename
+                if(verbose) {
+                  message(sprintf("\nRENAMING: '%s' to '%s' (similarity: %.2f%%)\n",
+                                  field, selected_match, all_matches[selected_match] * 100))
+                }
+                # Use [[ ]] to safely handle special characters in field names
+                field_data <- df[[field]]
+                df[[selected_match]] <- field_data
+                # Track rename
+                renamed$renamed_fields <- c(renamed$renamed_fields, field)
+                renamed$renames <- c(renamed$renames,
+                                     sprintf("%s -> %s (%.2f%%)",
+                                             field, selected_match, all_matches[selected_match] * 100))
               }
-              # Use [[ ]] to safely handle special characters in field names
-              field_data <- df[[field]]
-              df[[selected_match]] <- field_data
-              # Track rename
-              renamed$renamed_fields <- c(renamed$renamed_fields, field)
-              renamed$renames <- c(renamed$renames,
-                                   sprintf("%s -> %s (%.2f%%)",
-                                           field, selected_match, top_matches[match_idx] * 100))
             } else {
               # Ask if we should drop the field
               drop_input <- safe_readline(
@@ -1646,13 +2253,81 @@ validate_structure <- function(df, elements, measure_name, api, verbose = FALSE,
       }
     }
 
+    # Check for invalid GUID values
+    if(verbose) message("\n\nChecking for invalid GUID values...")
+
+    # First, create a list to store the specific issues
+    guid_issues <- list(
+      invalid_length = character(0),
+      duplicate_guids = list(),
+      valid = TRUE
+    )
+
+    # Check 1: GUID length validation (must be exactly 12 characters)
+    subjectkeys <- as.character(df$subjectkey)
+    invalid_length_mask <- nchar(subjectkeys) != 12 & !is.na(subjectkeys) # Create a boolean to see if there are any GUIDs that are not 12 characters long
+
+    if(any(invalid_length_mask)) {
+      guid_issues$invalid_length <- unique(subjectkeys[invalid_length_mask]) # Store the GUIDs that are not 12 characters long
+      guid_issues$valid <- FALSE # Set valid flag for GUIDs to FALSE
+
+      if(verbose) {
+        cat(sprintf("\n  ERROR: %d GUIDs with invalid length (must be 12 characters):", length(guid_issues$invalid_length)))
+        cat(sprintf("\n    %s", paste(head(guid_issues$invalid_length, 10), collapse=", ")))
+        if(length(guid_issues$invalid_length) > 10) {
+          cat(sprintf(" (and %d more)", length(guid_issues$invalid_length) - 10))
+        }
+      }
+    }
+
+    # Check 2: GUID uniqueness per src_subject_id
+    # Use aggregate to get unique src_subject_ids per GUID in one pass
+    valid_rows <- !is.na(df$subjectkey) & !is.na(df$src_subject_id)
+    if(any(valid_rows)) {
+      guid_src_unique <- stats::aggregate(df$src_subject_id[valid_rows],
+                                  by = list(GUID = df$subjectkey[valid_rows]),
+                                  FUN = function(x) length(unique(x)))
+
+      # Find GUIDs with more than one unique src_subject_id
+      problematic_guids <- guid_src_unique$GUID[guid_src_unique$x > 1]
+
+      if(length(problematic_guids) > 0) {
+        guid_issues$valid <- FALSE
+
+        # Only for problematic GUIDs, get the actual src_subject_id values
+        for(guid in problematic_guids) {
+          src_ids <- unique(df$src_subject_id[df$subjectkey == guid & !is.na(df$subjectkey)])
+          guid_issues$duplicate_guids[[guid]] <- src_ids
+        }
+
+        if(verbose) {
+          cat(sprintf("\n  ERROR: %d GUIDs used with multiple src_subject_ids:",
+                    length(problematic_guids))) # Show the user the # of GUIDs with multiple src_subject_ids
+          for(guid in head(problematic_guids, 5)) {
+            cat(sprintf("\n    '%s' -> %s", guid,
+                      paste(guid_issues$duplicate_guids[[guid]], collapse=", "))) # Show the invalid GUID and associated src_subject_ids
+          }
+          if(length(problematic_guids) > 5) {
+            cat(sprintf("\n    (and %d more problematic GUIDs)", length(problematic_guids) - 5))
+          }
+        }
+      }
+    }
+
+    # Update the the valid flag for results based on GUID issues
+    # Store the GUID issues list in results for later use in the summary
+    if(guid_issues$valid == FALSE) {
+      results$valid <- FALSE
+      results$guid_validation <- guid_issues # Store length issue GUIDs and duplicate GUIDs in results
+    }
+
     # Check required fields
     missing_required <- required_fields[!required_fields %in% df_cols]
     if(length(missing_required) > 0) {
       results$valid <- FALSE
       results$missing_required <- c(results$missing_required, missing_required)
       if(verbose) {
-        cat("\n\nMissing required fields:")
+        cat("\n\nMissing data for required elements:")
         cat(sprintf("\n  %s", paste(missing_required, collapse=", ")))
       }
     } else if(verbose) {
@@ -1780,6 +2455,29 @@ validate_structure <- function(df, elements, measure_name, api, verbose = FALSE,
 
         if(length(results$unknown_fields) > 10) {
           message(sprintf("  ... and %d more", length(results$unknown_fields) - 10))
+        }
+      }
+
+      # If GUID issues were found, report them
+      if(length(results$guid_validation) > 0) {
+        # First report the top 10 GUIDs with invalid length (if any)
+        if(length(results$guid_validation$invalid_length) > 0) {
+          message(sprintf("- GUIDs with invalid length found (must be 12 characters): %d (%s)",
+                          length(results$guid_validation$invalid_length),
+                          paste(head(results$guid_validation$invalid_length, 10), collapse=", ")))
+          if(length(results$guid_validation$invalid_length) > 10) {
+            message(sprintf("  ... and %d more", length(results$guid_validation$invalid_length) - 10))
+          }
+        }
+
+        # Report the top 10 GUIDs with multiple src_subject_ids (if any)
+        if(length(results$guid_validation$duplicate_guids) > 0) {
+            message(sprintf("- Non-unique GUIDs found: %d (%s)",
+                            length(results$guid_validation$duplicate_guids),
+                            paste(head(names(results$guid_validation$duplicate_guids), 10), collapse=", ")))
+          if(length(results$guid_validation$duplicate_guids) > 10) {
+            message(sprintf("  ... and %d more", length(results$guid_validation$duplicate_guids) - 10))
+          }
         }
       }
 
@@ -2112,6 +2810,476 @@ transform_value_ranges <- function(df, elements, verbose = FALSE) {
   return(df)
 }
 
+# Robust bidirectional transformation function for field values
+# Fixed bidirectional transformation function that properly handles empty cells
+transform_field_values <- function(df, elements, verbose = TRUE) {
+  if(verbose) cat("\n\n--- Transforming Field Values (Bidirectional) ---\n")
+
+  # Track all transformations
+  all_transformations <- list()
+  field_statuses <- list()
+
+  # Process each field in the structure
+  for (i in 1:nrow(elements)) {
+    field_name <- elements$name[i]
+    type <- elements$type[i]
+    value_range <- elements$valueRange[i]
+    notes <- elements$notes[i]
+
+    # Skip if field doesn't exist
+    if (!field_name %in% names(df)) next
+
+    # Get current field values
+    field_values <- df[[field_name]]
+    field_values_char <- as.character(field_values)
+
+    # Determine if we need a transformation
+    needs_transformation <- FALSE
+    transformation_direction <- NULL
+    invalid_values <- NULL
+
+    # Check numeric fields for non-numeric values
+    if (type %in% c("Integer", "Float")) {
+      # Test if values can be converted to numeric
+      numeric_test <- suppressWarnings(as.numeric(field_values_char))
+      # Handle empty strings - treat them as NA
+      empty_mask <- !is.na(field_values) & field_values_char == ""
+      if (any(empty_mask)) {
+        field_values_char[empty_mask] <- NA
+        field_values[empty_mask] <- NA
+      }
+
+      # Check for non-numeric, non-empty values
+      invalid_mask <- !is.na(field_values) & is.na(numeric_test) & field_values_char != ""
+
+      if (any(invalid_mask)) {
+        needs_transformation <- TRUE
+        transformation_direction <- "string_to_numeric"
+        invalid_values <- unique(field_values[invalid_mask])
+      }
+    }
+    # Check string fields that contain numeric values but should be text
+    else if (type == "String" && !is.null(value_range) && !is.na(value_range) && value_range != "") {
+      # If value range specifies text values but we have numbers
+      if (grepl(";", value_range) && !grepl("::", value_range)) {
+        valid_values <- trimws(strsplit(value_range, ";")[[1]])
+        # Check if valid values are non-numeric text
+        if (any(!suppressWarnings(all(!is.na(as.numeric(valid_values)))))) {
+          # Check if our current values are numeric and need conversion to text
+          is_numeric_mask <- !is.na(field_values) & !is.na(suppressWarnings(as.numeric(field_values_char)))
+          if (any(is_numeric_mask)) {
+            needs_transformation <- TRUE
+            transformation_direction <- "numeric_to_string"
+            invalid_values <- unique(field_values[is_numeric_mask])
+          }
+        }
+      }
+    }
+
+    # Skip if no transformation needed
+    if (!needs_transformation || length(invalid_values) == 0) next
+
+    if(verbose) {
+      cat(sprintf("\nField: %s", field_name))
+      cat(sprintf("\n  Type: %s", type))
+      cat(sprintf("\n  Expected range: %s", value_range))
+      cat(sprintf("\n  Direction: %s", transformation_direction))
+      cat(sprintf("\n  Invalid values: %s", paste(invalid_values, collapse=", ")))
+    }
+
+    # Extract mapping rules
+    mapping <- NULL
+
+    # Try to extract mapping from notes field
+    if (!is.null(notes) && !is.na(notes) && notes != "") {
+      # Get mapping rules - handle bidirectional mapping
+      mapping_result <- extract_bidirectional_mappings(notes, transformation_direction)
+      mapping <- mapping_result$mapping
+
+      if(verbose && !is.null(mapping) && length(mapping) > 0) {
+        cat("\n  Extracted mapping rules from notes:")
+        for (key in names(mapping)) {
+          cat(sprintf("\n    '%s' -> '%s'", key, mapping[[key]]))
+        }
+      }
+    }
+
+    # If no mapping found, try to create one based on value range
+    if ((is.null(mapping) || length(mapping) == 0) &&
+        !is.null(value_range) && !is.na(value_range) && value_range != "") {
+
+      if (transformation_direction == "string_to_numeric") {
+        # Get valid numeric values from value range
+        valid_values <- NULL
+        if (grepl("::", value_range)) {
+          # Numeric range (e.g., "1::3")
+          range_parts <- strsplit(value_range, "::")[[1]]
+          range_start <- as.numeric(range_parts[1])
+          range_end <- as.numeric(range_parts[2])
+          valid_values <- seq(from = range_start, to = range_end)
+        } else if (grepl(";", value_range)) {
+          # Discrete values (e.g., "1;2")
+          valid_values <- as.numeric(strsplit(value_range, ";")[[1]])
+        }
+
+        # Create position-based mapping if we have valid values
+        if (!is.null(valid_values) && length(invalid_values) <= length(valid_values)) {
+          mapping <- list()
+          for (j in 1:length(invalid_values)) {
+            # Skip empty strings - they'll be handled as NAs
+            if (invalid_values[j] != "") {
+              mapping[[as.character(invalid_values[j])]] <- as.character(valid_values[j])
+            }
+          }
+
+          if(verbose && length(mapping) > 0) {
+            cat("\n  Created position-based mapping:")
+            for (key in names(mapping)) {
+              cat(sprintf("\n    '%s' -> '%s'", key, mapping[[key]]))
+            }
+          }
+        }
+      }
+      else if (transformation_direction == "numeric_to_string") {
+        # Get valid string values from value range
+        if (grepl(";", value_range)) {
+          valid_text_values <- trimws(strsplit(value_range, ";")[[1]])
+
+          # Create position-based mapping if we have valid values
+          if (length(invalid_values) <= length(valid_text_values)) {
+            mapping <- list()
+            for (j in 1:length(invalid_values)) {
+              mapping[[as.character(invalid_values[j])]] <- valid_text_values[j]
+            }
+
+            if(verbose && length(mapping) > 0) {
+              cat("\n  Created position-based mapping:")
+              for (key in names(mapping)) {
+                cat(sprintf("\n    '%s' -> '%s'", key, mapping[[key]]))
+              }
+            }
+          }
+        }
+      }
+    }
+
+    # Apply the mapping if we have one
+    if (!is.null(mapping) && length(mapping) > 0) {
+      transformations <- list()
+      transformed_count <- 0
+
+      # Apply each mapping rule
+      for (from_value in names(mapping)) {
+        to_value <- mapping[[from_value]]
+
+        # Case-insensitive matching for text values
+        if (transformation_direction == "string_to_numeric") {
+          matches <- !is.na(field_values) &
+            tolower(field_values_char) == tolower(from_value)
+        } else {
+          # Exact matching for numeric values
+          matches <- !is.na(field_values) &
+            field_values_char == from_value
+        }
+
+        if (any(matches)) {
+          field_values_char[matches] <- to_value
+          transformed_count <- transformed_count + sum(matches)
+          transformations[[from_value]] <- list(
+            to = to_value,
+            count = sum(matches)
+          )
+        }
+      }
+
+      # Update the dataframe with transformed values
+      if (transformed_count > 0) {
+        # Apply the appropriate type conversion
+        if (transformation_direction == "string_to_numeric") {
+          if (type == "Integer") {
+            df[[field_name]] <- suppressWarnings(as.integer(field_values_char))
+          } else {
+            df[[field_name]] <- suppressWarnings(as.numeric(field_values_char))
+          }
+        } else {
+          # Just use the character values for string conversion
+          df[[field_name]] <- field_values_char
+        }
+
+        # Record successful transformation
+        all_transformations[[field_name]] <- transformations
+        field_statuses[[field_name]] <- "FIXED"
+
+        if(verbose) {
+          cat("\n  FIXED: Transformed values")
+          for (value in names(transformations)) {
+            cat(sprintf("\n    '%s' -> '%s' (%d occurrences)",
+                        value, transformations[[value]]$to,
+                        transformations[[value]]$count))
+          }
+        }
+      } else {
+        field_statuses[[field_name]] <- "FAILED"
+        if(verbose) cat("\n  FAILED: Could not transform all values")
+      }
+    } else {
+      field_statuses[[field_name]] <- "FAILED"
+      if(verbose) cat("\n  FAILED: No mapping rules found")
+    }
+
+    # Always handle empty strings separately for numeric fields
+    if (type %in% c("Integer", "Float")) {
+      # Convert empty strings to NA
+      empty_mask <- !is.na(df[[field_name]]) & as.character(df[[field_name]]) == ""
+      if (any(empty_mask)) {
+        if(verbose) {
+          cat(sprintf("\n  Converting %d empty string values to NA", sum(empty_mask)))
+        }
+        df[[field_name]][empty_mask] <- NA
+      }
+    }
+  }
+
+  # Final summary report
+  if(verbose && length(all_transformations) > 0) {
+    cat("\n\nField Value Transformation Summary:")
+    for (field in names(all_transformations)) {
+      cat(sprintf("\n- %s: %s", field, field_statuses[[field]]))
+      if (field_statuses[[field]] == "FIXED") {
+        # Calculate total transformations for this field
+        total_transformed <- sum(sapply(all_transformations[[field]],
+                                        function(x) x$count))
+        cat(sprintf(" (%d values transformed)", total_transformed))
+      }
+    }
+    cat("\n")
+  }
+
+  return(df)
+}
+# Helper function to extract bidirectional mappings from notes
+extract_bidirectional_mappings <- function(notes, direction = "string_to_numeric") {
+  if (is.null(notes) || is.na(notes) || notes == "") {
+    return(list(mapping = NULL, source = "none"))
+  }
+
+  mapping <- list()
+  source <- "none"
+
+  # Try multiple pattern matching approaches
+
+  # 1. Look for explicit mappings with equals sign
+  # Format: "text=number" or "number=text"
+  if (grepl("=", notes)) {
+    parts <- strsplit(notes, "[;,]")[[1]]
+    for (part in parts) {
+      if (grepl("=", part)) {
+        key_value <- strsplit(part, "=")[[1]]
+        if (length(key_value) >= 2) {
+          key <- trimws(key_value[1])
+          value <- trimws(key_value[2])
+
+          # Determine which is the string and which is the number
+          key_numeric <- suppressWarnings(!is.na(as.numeric(key)))
+          value_numeric <- suppressWarnings(!is.na(as.numeric(value)))
+
+          if (key_numeric && !value_numeric) {
+            # number=text format
+            if (direction == "numeric_to_string") {
+              mapping[[key]] <- value
+            } else {
+              mapping[[value]] <- key
+            }
+          } else if (!key_numeric && value_numeric) {
+            # text=number format
+            if (direction == "string_to_numeric") {
+              mapping[[key]] <- value
+            } else {
+              mapping[[value]] <- key
+            }
+          }
+        }
+      }
+    }
+
+    if (length(mapping) > 0) {
+      source <- "equals_pattern"
+      return(list(mapping = mapping, source = source))
+    }
+  }
+
+  # 2. Look for "X means Y" or "X represents Y" patterns
+  patterns <- c(
+    "([^ ]+)\\s+means\\s+([^ ]+)",
+    "([^ ]+)\\s+represents\\s+([^ ]+)",
+    "([^ ]+)\\s+is\\s+([^ ]+)",
+    "([^ ]+)\\s+for\\s+([^ ]+)"
+  )
+
+  for (pattern in patterns) {
+    matches <- gregexpr(pattern, notes, perl = TRUE)
+    if (matches[[1]][1] != -1) {
+      result <- regmatches(notes, matches)[[1]]
+      for (match in result) {
+        parts <- regexec(pattern, match, perl = TRUE)
+        extracted <- regmatches(match, parts)[[1]]
+        if (length(extracted) >= 3) {
+          key <- trimws(extracted[2])
+          value <- trimws(extracted[3])
+
+          # Determine which is the string and which is the number
+          key_numeric <- suppressWarnings(!is.na(as.numeric(key)))
+          value_numeric <- suppressWarnings(!is.na(as.numeric(value)))
+
+          if (key_numeric && !value_numeric) {
+            # number means/represents text format
+            if (direction == "numeric_to_string") {
+              mapping[[key]] <- value
+            } else {
+              mapping[[value]] <- key
+            }
+          } else if (!key_numeric && value_numeric) {
+            # text means/represents number format
+            if (direction == "string_to_numeric") {
+              mapping[[key]] <- value
+            } else {
+              mapping[[value]] <- key
+            }
+          }
+        }
+      }
+    }
+
+    if (length(mapping) > 0) {
+      source <- "means_pattern"
+      return(list(mapping = mapping, source = source))
+    }
+  }
+
+  # 3. Last resort - try to find any pattern with text and numbers in notes
+  text_num_pattern <- "([a-zA-Z:_-]+)\\s*[=:]\\s*(\\d+)"
+  num_text_pattern <- "(\\d+)\\s*[=:]\\s*([a-zA-Z:_-]+)"
+
+  # Choose pattern based on transformation direction
+  if (direction == "string_to_numeric") {
+    pattern <- text_num_pattern
+  } else {
+    pattern <- num_text_pattern
+  }
+
+  matches <- gregexpr(pattern, notes, perl = TRUE)
+  if (matches[[1]][1] != -1) {
+    result <- regmatches(notes, matches)[[1]]
+    for (match in result) {
+      parts <- regexec(pattern, match, perl = TRUE)
+      extracted <- regmatches(match, parts)[[1]]
+      if (length(extracted) >= 3) {
+        if (direction == "string_to_numeric") {
+          text_val <- trimws(extracted[2])
+          num_val <- trimws(extracted[3])
+          mapping[[text_val]] <- num_val
+        } else {
+          num_val <- trimws(extracted[2])
+          text_val <- trimws(extracted[3])
+          mapping[[num_val]] <- text_val
+        }
+      }
+    }
+
+    if (length(mapping) > 0) {
+      source <- "general_pattern"
+      return(list(mapping = mapping, source = source))
+    }
+  }
+
+  # If we get here, no mappings were found
+  return(list(mapping = mapping, source = source))
+}
+
+# Function to parse RedCap select_choices_or_calculations and convert to NDA ValueRange format
+parse_redcap_choices_to_value_range <- function(choices_string) {
+  if (is.null(choices_string) || is.na(choices_string) || choices_string == "") {
+    return("")
+  }
+  
+  # Split by pipe (|) to get individual choices
+  choices <- strsplit(choices_string, "\\|")[[1]]
+  choices <- trimws(choices)
+  
+  # Parse each choice (format: "value, label" or "value, label")
+  parsed_choices <- character(0)
+  for (choice in choices) {
+    if (choice != "") {
+      # Split by comma to separate value and label
+      parts <- strsplit(choice, ",")[[1]]
+      if (length(parts) >= 2) {
+        value <- trimws(parts[1])
+        label <- trimws(paste(parts[-1], collapse = ","))  # In case label contains commas
+        # Format as NDA ValueRange: "value; label"
+        parsed_choices <- c(parsed_choices, paste0(value, "; ", label))
+      } else if (length(parts) == 1) {
+        # If no comma, treat the whole thing as a value
+        parsed_choices <- c(parsed_choices, trimws(parts[1]))
+      }
+    }
+  }
+  
+  # Join with semicolons for NDA format
+  return(paste(parsed_choices, collapse = "; "))
+}
+
+# Function to enhance NDA elements with RedCap metadata
+enhance_elements_with_redcap_metadata <- function(elements, redcap_metadata) {
+  if (is.null(redcap_metadata) || !is.data.frame(redcap_metadata)) {
+    return(elements)
+  }
+  
+  # Create mappings from RedCap metadata
+  redcap_label_map <- NULL
+  redcap_choices_map <- NULL
+  
+  if (all(c("field_name", "field_label") %in% names(redcap_metadata))) {
+    redcap_label_map <- redcap_metadata$field_label
+    names(redcap_label_map) <- redcap_metadata$field_name
+  }
+  
+  if ("select_choices_or_calculations" %in% names(redcap_metadata)) {
+    redcap_choices_map <- redcap_metadata$select_choices_or_calculations
+    names(redcap_choices_map) <- redcap_metadata$field_name
+    # Remove NA values
+    redcap_choices_map <- redcap_choices_map[!is.na(redcap_choices_map) & redcap_choices_map != ""]
+  }
+  
+  # Enhance elements with RedCap metadata
+  for (i in 1:nrow(elements)) {
+    field_name <- elements$name[i]
+    
+    # Enhance description with field_label if available
+    if (!is.null(redcap_label_map) && field_name %in% names(redcap_label_map)) {
+      current_desc <- elements$description[i]
+      if (is.null(current_desc) || current_desc == "" || is.na(current_desc)) {
+        elements$description[i] <- as.character(redcap_label_map[[field_name]])
+      }
+    }
+    
+    # Enhance valueRange with select_choices_or_calculations if available
+    if (!is.null(redcap_choices_map) && field_name %in% names(redcap_choices_map)) {
+      current_value_range <- elements$valueRange[i]
+      if (is.null(current_value_range) || current_value_range == "" || is.na(current_value_range)) {
+        redcap_choices <- redcap_choices_map[[field_name]]
+        if (!is.null(redcap_choices) && !is.na(redcap_choices) && redcap_choices != "") {
+          parsed_value_range <- parse_redcap_choices_to_value_range(redcap_choices)
+          if (parsed_value_range != "") {
+            elements$valueRange[i] <- parsed_value_range
+          }
+        }
+      }
+    }
+  }
+  
+  return(elements)
+}
+
 # Updated ndaValidator to incorporate better missing value handling
 # Updated ndaValidator to incorporate better missing value handling
 ndaValidator <- function(measure_name,
@@ -2121,7 +3289,8 @@ ndaValidator <- function(measure_name,
                          verbose = TRUE,
                          debug = FALSE,
                          auto_drop_unknown = FALSE,
-                         interactive_mode = TRUE) {
+                         interactive_mode = TRUE,
+                         modified_structure = NULL) {
   tryCatch({
     # Initialize a list to track all columns to be removed
     all_columns_to_drop <- character(0)
@@ -2132,6 +3301,22 @@ ndaValidator <- function(measure_name,
 
     # Get the dataframe from the environment
     df <- base::get(measure_name, envir = .wizaRdry_env)
+
+    # Enhance with RedCap metadata if available and api is "redcap"
+    redcap_metadata <- NULL
+    if (api == "redcap") {
+      try({
+        # Try to get RedCap metadata
+        if (!is.null(attr(df, "redcap_instrument"))) {
+          redcap_metadata <- redcap.dict(df)
+        } else {
+          redcap_metadata <- redcap.dict(measure_name)
+        }
+        if (verbose && !is.null(redcap_metadata)) {
+          message("Enhanced validation with RedCap metadata")
+        }
+      }, silent = TRUE)
+    }
 
     # Force all complex/problematic data types to character immediately
     for (col in names(df)) {
@@ -2169,13 +3354,44 @@ ndaValidator <- function(measure_name,
     # Save the cleaned dataframe
     assign(measure_name, df, envir = .wizaRdry_env)
 
-    # Get structure name and fetch elements
+    # Get structure name and fetch/use elements
     structure_name <- measure_name
-    message("\n\nFetching ", structure_name, " Data Structure from NDA API...")
-    elements <- fetch_structure_elements(structure_name, nda_base_url)
+
+    if (!is.null(modified_structure)) {
+      # Use the enhanced structure that was passed in
+      message("\n\nUsing enhanced NDA structure with ndar_subject01 definitions...")
+      elements <- modified_structure$dataElements
+
+      if (is.null(elements) || nrow(elements) == 0) {
+        stop("Enhanced structure contains no dataElements")
+      }
+
+      message(sprintf("Enhanced structure contains %d field definitions", nrow(elements)))
+
+      # Show what key fields are now defined
+      key_fields <- c("race", "phenotype", "phenotype_description", "twins_study", "sibling_study")
+      enhanced_fields <- intersect(key_fields, elements$name)
+      if (length(enhanced_fields) > 0) {
+        message(sprintf("Enhanced with ndar_subject01 definitions for: %s",
+                        paste(enhanced_fields, collapse = ", ")))
+      }
+
+    } else {
+      # Original logic: fetch from API
+      message("\n\nFetching ", structure_name, " Data Structure from NDA API...")
+      elements <- fetch_structure_elements(structure_name, nda_base_url)
+    }
 
     if (is.null(elements) || nrow(elements) == 0) {
       stop("No elements found in the structure definition")
+    }
+
+    # Enhance elements with RedCap metadata if available
+    if (!is.null(redcap_metadata)) {
+      elements <- enhance_elements_with_redcap_metadata(elements, redcap_metadata)
+      if (verbose) {
+        message("Enhanced NDA elements with RedCap metadata")
+      }
     }
 
     # PHASE 1: NA Value Mapping
@@ -2228,6 +3444,12 @@ ndaValidator <- function(measure_name,
     missing_required_fields <- attr(df, "missing_required_fields")
     if(is.null(missing_required_fields)) missing_required_fields <- character(0)
 
+    # Transform field values using bidirectional approach
+    df <- transform_field_values(df, elements, verbose = verbose)
+
+    # Convert array fields to numeric codes - ADD THIS LINE
+    df <- convert_array_fields(df, elements, verbose = verbose)
+
     # Apply type conversions
     df <- apply_type_conversions(df, elements, verbose = verbose)
 
@@ -2258,16 +3480,20 @@ ndaValidator <- function(measure_name,
       fields_to_drop <- setdiff(validation_results$unknown_fields_dropped, renamed_fields)
       all_columns_to_drop <- c(all_columns_to_drop, fields_to_drop)
     }
-
     # Provide an attribute to the validation result with the processed dataframe
     # This allows the calling function to access the updated dataframe
     validation_results$df <- df
+
+    # Store NDA structure as an attribute
+    attr(validation_results, "nda_structure") <- list(
+      shortName = structure_name,
+      dataElements = elements
+    )
 
     # Final check for missing required values
     if(!validation_results$valid && length(validation_results$missing_required) > 0) {
       if(verbose) message("\nValidation FAILED: Required fields are missing or contain NA values")
     }
-
     return(validation_results)
   }, error = function(e) {
     message("Error in ndaValidator: ", e$message)
@@ -2324,6 +3550,198 @@ check_special_values <- function(measure_name, verbose = TRUE) {
   }
 
   return(invisible(special_value_cols))
+}
+
+#' Get field value range from NDA elements
+#'
+#' @param field_name Name of the field
+#' @param elements NDA data elements
+#' @return Value range string or "No range specified"
+#' @noRd
+get_field_value_range <- function(field_name, elements) {
+  if (is.null(elements) || nrow(elements) == 0) {
+    return("No range specified")
+  }
+  
+  # Find the field in elements
+  field_idx <- which(elements$name == field_name)
+  if (length(field_idx) == 0) {
+    return("No range specified")
+  }
+  
+  # Get the value range
+  value_range <- elements$valueRange[field_idx[1]]
+  if (is.null(value_range) || is.na(value_range) || value_range == "") {
+    return("No range specified")
+  }
+  
+  return(as.character(value_range))
+}
+
+#' Check if two value ranges are compatible for renaming
+#'
+#' @param source_range Value range of source field
+#' @param target_range Value range of target field
+#' @param source_field Name of source field
+#' @param target_field Name of target field
+#' @param verbose Whether to print verbose output
+#' @return List with compatibility check results
+#' @noRd
+check_value_range_compatibility <- function(source_range, target_range, source_field, target_field, verbose = FALSE) {
+  
+  # If either range is missing, they're compatible
+  if (source_range == "No range specified" || target_range == "No range specified") {
+    return(list(
+      compatible = TRUE,
+      message = "One or both fields have no value range specified",
+      recommendation = "Proceed with caution - ranges cannot be validated"
+    ))
+  }
+  
+  # If ranges are identical, they're compatible
+  if (source_range == target_range) {
+    return(list(
+      compatible = TRUE,
+      message = "Value ranges are identical",
+      recommendation = "Safe to rename"
+    ))
+  }
+  
+  # Parse the ranges to extract numeric ranges and special codes
+  source_parts <- parse_value_range(source_range)
+  target_parts <- parse_value_range(target_range)
+  
+  # Check if both have numeric ranges
+  if (!is.null(source_parts$numeric_range) && !is.null(target_parts$numeric_range)) {
+    source_min <- source_parts$numeric_range$min
+    source_max <- source_parts$numeric_range$max
+    target_min <- target_parts$numeric_range$min
+    target_max <- target_parts$numeric_range$max
+    
+    # Check if ranges overlap significantly
+    overlap_min <- max(source_min, target_min)
+    overlap_max <- min(source_max, target_max)
+    overlap_size <- max(0, overlap_max - overlap_min + 1)
+    
+    source_size <- source_max - source_min + 1
+    target_size <- target_max - target_min + 1
+    
+    # Calculate overlap percentage
+    overlap_percentage <- overlap_size / min(source_size, target_size) * 100
+    
+    if (overlap_percentage >= 80) {
+      return(list(
+        compatible = TRUE,
+        message = sprintf("Numeric ranges overlap by %.1f%% - likely compatible", overlap_percentage),
+        recommendation = "Proceed with rename"
+      ))
+    } else if (overlap_percentage >= 50) {
+      return(list(
+        compatible = FALSE,
+        message = sprintf("Numeric ranges overlap by only %.1f%% - potential conflict", overlap_percentage),
+        recommendation = "Consider creating a new field instead of renaming"
+      ))
+    } else {
+      return(list(
+        compatible = FALSE,
+        message = sprintf("Numeric ranges have minimal overlap (%.1f%%) - likely incompatible", overlap_percentage),
+        recommendation = "Create a new field instead of renaming"
+      ))
+    }
+  }
+  
+  # Handle cases where we have only special codes (no numeric range)
+  # Special codes (like 888, 999, -777) are placeholders and don't affect compatibility
+  source_missing <- source_parts$missing_codes
+  target_missing <- target_parts$missing_codes
+  
+  # If both have missing codes, they're compatible (special codes are placeholders)
+  if (!is.null(source_missing) && !is.null(target_missing)) {
+    return(list(
+      compatible = TRUE,
+      message = "Both fields have special codes (placeholders) - compatible",
+      recommendation = "Proceed with rename"
+    ))
+  }
+  
+  # If one has missing codes and the other doesn't, that's compatible
+  # Special codes are placeholders and don't restrict the valid data range
+  if ((!is.null(source_missing) && is.null(target_missing)) || 
+      (is.null(source_missing) && !is.null(target_missing))) {
+    return(list(
+      compatible = TRUE,
+      message = "Special codes are placeholders and don't affect compatibility",
+      recommendation = "Proceed with rename"
+    ))
+  }
+  
+  # If neither has numeric ranges nor special codes, they're compatible
+  if (is.null(source_parts$numeric_range) && is.null(target_parts$numeric_range) &&
+      is.null(source_missing) && is.null(target_missing)) {
+    return(list(
+      compatible = TRUE,
+      message = "Neither field has defined ranges - compatible",
+      recommendation = "Proceed with rename"
+    ))
+  }
+  
+  # If we get here, ranges are different and potentially incompatible
+  return(list(
+    compatible = FALSE,
+    message = "Value ranges are significantly different",
+    recommendation = "Create a new field instead of renaming to avoid data loss"
+  ))
+}
+
+#' Parse a value range string to extract numeric ranges and missing codes
+#'
+#' @param value_range Value range string (e.g., "0::6;999=missing")
+#' @return List with parsed components
+#' @noRd
+parse_value_range <- function(value_range) {
+  if (is.null(value_range) || is.na(value_range) || value_range == "") {
+    return(list(numeric_range = NULL, missing_codes = NULL))
+  }
+  
+  # Split by semicolon
+  parts <- trimws(strsplit(value_range, ";")[[1]])
+  
+  numeric_range <- NULL
+  missing_codes <- NULL
+  
+  for (part in parts) {
+    if (grepl("::", part)) {
+      # This is a numeric range (e.g., "0::6")
+      range_parts <- strsplit(part, "::")[[1]]
+      if (length(range_parts) == 2) {
+        min_val <- as.numeric(range_parts[1])
+        max_val <- as.numeric(range_parts[2])
+        if (!is.na(min_val) && !is.na(max_val)) {
+          numeric_range <- list(min = min_val, max = max_val)
+        }
+      }
+    } else if (grepl("=", part)) {
+      # This is a missing code with meaning (e.g., "999=missing")
+      code_parts <- strsplit(part, "=")[[1]]
+      if (length(code_parts) == 2) {
+        code <- trimws(code_parts[1])
+        meaning <- trimws(code_parts[2])
+        if (grepl("missing|na|not.*applicable", meaning, ignore.case = TRUE)) {
+          if (is.null(missing_codes)) missing_codes <- character(0)
+          missing_codes <- c(missing_codes, code)
+        }
+      }
+    } else {
+      # This is a standalone special code (e.g., "888", "-777", "999")
+      # Check if it's a numeric value that could be a special code
+      if (grepl("^-?\\d+$", part)) {
+        if (is.null(missing_codes)) missing_codes <- character(0)
+        missing_codes <- c(missing_codes, part)
+      }
+    }
+  }
+  
+  return(list(numeric_range = numeric_range, missing_codes = missing_codes))
 }
 
 

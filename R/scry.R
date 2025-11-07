@@ -28,12 +28,14 @@
 #'   - mongo/
 #'   - qualtrics/
 #'   - redcap/
+#'   - oracle/
 #'   - sql/
 #' - nda/
 #'   - csv/
 #'   - mongo/
 #'   - qualtrics/
 #'   - redcap/
+#'   - oracle/
 #'   - sql/
 #' - tmp/
 #'
@@ -63,23 +65,35 @@
 #' @export
 scry <- function(study_alias = NULL, path = ".", overwrite = FALSE, repair = FALSE, show_tree = NULL,
                  create_project = FALSE, examples = FALSE, skip_prompt = TRUE) {
-
   # Check for user preferences file
   user_prefs_file <- file.path(path, ".wizaRdry_prefs")
   user_prefs <- list(shown_tree = FALSE, auto_create = FALSE)
 
   if (file.exists(user_prefs_file)) {
-    tryCatch({
-      user_prefs <- readRDS(user_prefs_file)
-    }, error = function(e) {
-      # If file exists but can't be read, create a new one
-      user_prefs <- list(shown_tree = FALSE, auto_create = FALSE)
-    })
+    tryCatch(
+      {
+        user_prefs <- readRDS(user_prefs_file)
+      },
+      error = function(e) {
+        # If file exists but can't be read, create a new one
+        user_prefs <- list(shown_tree = FALSE, auto_create = FALSE)
+      }
+    )
   }
 
+  # Check if this looks like a wizaRdry project structure
+  has_clean <- dir.exists(file.path(path, "clean"))
+  has_nda <- dir.exists(file.path(path, "nda"))
+  has_config <- file.exists(file.path(path, "config.yml"))
+  has_secrets <- file.exists(file.path(path, "secrets.R"))
+  has_main <- file.exists(file.path(path, "main.R"))
+
+  structure_exists <- has_clean || has_nda || has_config || has_secrets || has_main
+
+
   # If skip_prompt is TRUE or user has previously set auto_create to TRUE, bypass the prompt
-  if (!skip_prompt | !user_prefs$auto_create) {
-    response <- readline(prompt = "Would you like to create the wizaRdry project structure? y/n ")
+  if (!structure_exists && (!skip_prompt || !user_prefs$auto_create)) {
+    response <- readline(prompt = "No wizaRdry project found. Would you like to create the wizaRdry project structure? y/n ")
 
     while (!tolower(response) %in% c("y", "n")) {
       response <- readline(prompt = "Please enter either y or n: ")
@@ -120,12 +134,14 @@ scry <- function(study_alias = NULL, path = ".", overwrite = FALSE, repair = FAL
     file.path(path, "clean", "mongo"),
     file.path(path, "clean", "qualtrics"),
     file.path(path, "clean", "redcap"),
+    file.path(path, "clean", "oracle"),
     file.path(path, "clean", "sql"),
     file.path(path, "nda"),
     file.path(path, "nda", "csv"),
     file.path(path, "nda", "mongo"),
     file.path(path, "nda", "qualtrics"),
     file.path(path, "nda", "redcap"),
+    file.path(path, "nda", "oracle"),
     file.path(path, "nda", "sql"),
     file.path(path, "tmp")
   )
@@ -137,15 +153,7 @@ scry <- function(study_alias = NULL, path = ".", overwrite = FALSE, repair = FAL
     file.path(path, "main.R")
   )
 
-  # Check if this looks like a wizaRdry project structure
-  has_clean <- dir.exists(file.path(path, "clean"))
-  has_nda <- dir.exists(file.path(path, "nda"))
-  has_config <- file.exists(file.path(path, "config.yml"))
-  has_secrets <- file.exists(file.path(path, "secrets.R"))
-  has_main <- file.exists(file.path(path, "main.R"))
-
   # If structure partially exists but is incomplete
-  structure_exists <- has_clean || has_nda || has_config || has_secrets || has_main
   structure_complete <- all(sapply(expected_dirs, dir.exists)) &&
     all(sapply(expected_files, file.exists))
 
@@ -163,8 +171,8 @@ scry <- function(study_alias = NULL, path = ".", overwrite = FALSE, repair = FAL
       stop(
         "Incomplete wizaRdry directory structure detected.\n",
         "Missing components:\n",
-        if(length(missing_dirs) > 0) paste0("  Directories: ", paste(missing_dirs, collapse=", "), "\n") else "",
-        if(length(missing_files) > 0) paste0("  Files: ", paste(missing_files, collapse=", "), "\n") else "",
+        if (length(missing_dirs) > 0) paste0("  Directories: ", paste(missing_dirs, collapse = ", "), "\n") else "",
+        if (length(missing_files) > 0) paste0("  Files: ", paste(missing_files, collapse = ", "), "\n") else "",
         "Use scry(repair = TRUE) to repair the structure."
       )
     } else {
@@ -187,7 +195,7 @@ scry <- function(study_alias = NULL, path = ".", overwrite = FALSE, repair = FAL
 
   # Create .gitkeep files to ensure empty directories are tracked by git
   for (dir in expected_dirs) {
-    if (dir != path) {  # Don't add .gitkeep to the root directory
+    if (dir != path) { # Don't add .gitkeep to the root directory
       gitkeep_file <- file.path(dir, ".gitkeep")
       if (!file.exists(gitkeep_file)) {
         file.create(gitkeep_file)
@@ -258,7 +266,7 @@ scry <- function(study_alias = NULL, path = ".", overwrite = FALSE, repair = FAL
     paste0("  study_alias: ", ifelse(isFALSE(study_alias), "test", tolower(study_alias))),
     "  identifier: src_subject_id",
     "  mongo:",
-    "    #collection: ${study_alias}",
+    "    #database: ${study_alias}",
     "  qualtrics:",
     "    #survey_ids:",
     "      Institution1:",
@@ -268,6 +276,23 @@ scry <- function(study_alias = NULL, path = ".", overwrite = FALSE, repair = FAL
     "  redcap:",
     "    #primary_key: record_id",
     "    #superkey: ndar_subject01",
+    "  # Configuration for both SQL and ORACLE",
+    "  sql:",
+    "    # Primary key and superkey table configuration",
+    "    #primary_key: 'PARTICIPANTIDENTIFIER'",
+    "    #superkey: 'COMPASS_DATA.STUDYPARTICIPANTS'",
+    "    # Schema of interest (for displaying tables)",
+    "    #schema: 'COMPASS_DATA'",
+    "    # Fields marked as PII to excude (personally identifiable information)",
+    "    #pii_fields:",
+    "      - 'DATEOFBIRTH'",
+    "      - 'DOB'",
+    "      - 'EMAIL'",
+    "      - 'FIRSTNAME'",
+    "      - 'LASTNAME'",
+    "      - 'SSN'",
+    "      - 'PHONE'",
+    "      - 'ADDRESS'",
     "  missing_data_codes:",
     "    #skipped:",
     "      #- -888   # Skip pattern/branching logic",
@@ -305,6 +330,11 @@ scry <- function(study_alias = NULL, path = ".", overwrite = FALSE, repair = FAL
     "",
     "# Mongo",
     "connectionString <- \"\"",
+    "",
+    "# SQL or ORACLE Server",
+    "host <- \"\"",
+    "uid <- \"\"",
+    "pwd <- \"\"",
     sep = "\n"
   )
 
@@ -348,9 +378,9 @@ scry <- function(study_alias = NULL, path = ".", overwrite = FALSE, repair = FAL
         "#",
         "# clean/mongo/collection.R",
         "#",
-        '# config:  database name is defined in config.yml',
-        '# secrets: connectionString is defined in secrets.R',
-        '# encrypt: the *.pem file must be placed in the root of this repository',
+        "# config:  database name is defined in config.yml",
+        "# secrets: connectionString is defined in secrets.R",
+        "# encrypt: the *.pem file must be placed in the root of this repository",
         "#",
         "# return a list of the collection(s) from MongoDB",
         "# mongo.index()",
@@ -379,7 +409,7 @@ scry <- function(study_alias = NULL, path = ".", overwrite = FALSE, repair = FAL
         "# return a list of the survey(s) from Qualtrics",
         "# qualtrics.index()",
         "#",
-        "# get collection from Qualtrics",
+        "# get survey from Qualtrics",
         "# IMPORTANT: both variable name and script filename must match",
         "survey <- qualtrics(\"survey\")",
         "",
@@ -534,8 +564,10 @@ display_tree <- function(path) {
   # Function to list all files and directories in a directory
   list_all <- function(dir_path) {
     # Get all files and directories in the directory
-    all_items <- list.files(dir_path, all.files = FALSE, include.dirs = TRUE,
-                            recursive = FALSE, full.names = TRUE)
+    all_items <- list.files(dir_path,
+      all.files = FALSE, include.dirs = TRUE,
+      recursive = FALSE, full.names = TRUE
+    )
 
     # Separate dirs and files
     is_dir <- file.info(all_items)$isdir
@@ -628,4 +660,3 @@ display_tree <- function(path) {
 
   return(invisible(NULL))
 }
-

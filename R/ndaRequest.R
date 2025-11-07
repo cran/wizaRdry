@@ -38,6 +38,7 @@ nda <- function(..., csv = FALSE, rdata = FALSE, spss = FALSE, limited_dataset =
   redcap_list <- tools::file_path_sans_ext(list.files("./nda/redcap"))
   qualtrics_list <- tools::file_path_sans_ext(list.files("./nda/qualtrics"))
   mongo_list <- tools::file_path_sans_ext(list.files("./nda/mongo"))
+  oracle_list <- tools::file_path_sans_ext(list.files("./nda/oracle"))
   sql_list <- tools::file_path_sans_ext(list.files("./nda/sql"))
 
   # Get identifier from config
@@ -70,7 +71,7 @@ nda <- function(..., csv = FALSE, rdata = FALSE, spss = FALSE, limited_dataset =
       data_list <- as.character(data_list)
     }
 
-    user_prefs_file <- file.path(path, "..wizaRdry_prefs")
+    user_prefs_file <- file.path(path, ".wizaRdry_prefs")
     user_prefs <- list(shown_tree = FALSE, auto_create = FALSE, auto_clean = FALSE, auto_nda = FALSE)
 
     if (file.exists(user_prefs_file)) {
@@ -86,9 +87,15 @@ nda <- function(..., csv = FALSE, rdata = FALSE, spss = FALSE, limited_dataset =
       })
     }
 
+    # Create a list name_changes to store updated script_names
+    name_changes <- list()
+
+    # Create a character vector for failed validation tracking
+    failed_validations <- character(0)
+
     # Your existing code to determine structures to create
     # For example:
-    invalid_structures <- Filter(function(measure) !measure %in% c(csv_list, redcap_list, qualtrics_list, mongo_list, sql_list), data_list)
+    invalid_structures <- Filter(function(measure) !measure %in% c(csv_list, redcap_list, qualtrics_list, mongo_list, oracle_list, sql_list), data_list)
 
     # If we have structures to create and need to prompt
     if (length(invalid_structures) > 0) {
@@ -119,7 +126,9 @@ nda <- function(..., csv = FALSE, rdata = FALSE, spss = FALSE, limited_dataset =
 
       # Process each invalid script
       for (script_name in invalid_structures) {
-        message(sprintf("\nProcessing script: %s", script_name))
+        message(sprintf("Processing script: %s\n", script_name))
+
+        original_name <- script_name  # Store the original name for tracking changes
 
         # Improved validation function for NDA data structure names
         validate_script_name <- function(script_name, nda_base_url = "https://nda.nih.gov/api/datadictionary/v2") {
@@ -141,10 +150,15 @@ nda <- function(..., csv = FALSE, rdata = FALSE, spss = FALSE, limited_dataset =
             status_code <- httr::status_code(response)
 
             if (status_code == 200) {
-              # Try to parse the JSON with error handling
+              # Try to parse the JSON with handling for errors and empty string responses
               content <- tryCatch({
-                jsonlite::fromJSON(rawToChar(response$content))
-              }, error = function(e) {
+                raw_content <- rawToChar(response$content) # store raw_content
+                if (nchar(raw_content) > 0) { # if there is content
+                  jsonlite::fromJSON(raw_content)
+                } else { # response is valid but content is empty
+                  NULL # set content to NULL and go to similarity search
+                }
+              }, error = function(e) { # throw an error if something is wrong
                 message("Error parsing API response: ", e$message)
                 return(NULL)
               })
@@ -166,10 +180,10 @@ nda <- function(..., csv = FALSE, rdata = FALSE, spss = FALSE, limited_dataset =
           }
 
           # If we get here, the direct lookup failed, so search for similar structures
-          search_url <- sprintf("%s/datastructure", nda_base_url)
+          search_url <- sprintf("%s/datastructure", nda_base_url) # API endpoint to search and get all NDA data structures
 
           search_response <- tryCatch({
-            httr::GET(search_url, httr::timeout(10))
+            httr::GET(search_url, httr::timeout(10)) # Get and store all NDA data structures
           }, error = function(e) {
             message("Network error when searching NDA API: ", e$message)
             return(NULL)
@@ -178,14 +192,19 @@ nda <- function(..., csv = FALSE, rdata = FALSE, spss = FALSE, limited_dataset =
           if (!is.null(search_response) && httr::status_code(search_response) == 200) {
             # Try to parse the JSON with error handling
             all_structures <- tryCatch({
-              content <- jsonlite::fromJSON(rawToChar(search_response$content))
-              if (is.data.frame(content)) {
-                content
+              raw_content <- rawToChar(search_response$content)
+              if (nchar(raw_content) > 0) {
+                content <- jsonlite::fromJSON(raw_content)
+                if (is.data.frame(content)) {
+                  content
+                } else {
+                  message("Unexpected API response format: not a data frame")
+                  return(data.frame())
+                }
               } else {
-                message("Unexpected API response format: not a data frame")
-                return(data.frame())
+                data.frame() # Pass in an empty dataframe if api response is empty
               }
-            }, error = function(e) {
+            }, error = function(e) { # Throw an error if something else is wrong.
               message("Error parsing API response: ", e$message)
               return(data.frame())
             })
@@ -202,7 +221,7 @@ nda <- function(..., csv = FALSE, rdata = FALSE, spss = FALSE, limited_dataset =
                 # Safely calculate similarities
                 similarities <- tryCatch({
                   sapply(all_structures$shortName, function(name) {
-                    calculate_similarity(script_name, name)
+                    calculate_jaro_winkler(script_name, name)
                   })
                 }, error = function(e) {
                   message("Error calculating similarities: ", e$message)
@@ -210,36 +229,91 @@ nda <- function(..., csv = FALSE, rdata = FALSE, spss = FALSE, limited_dataset =
                 })
 
                 if (length(similarities) > 0) {
-                  # Get top matches but handle possible errors
+                  # Get all matches sorted by similarity (let pagination handle display)
                   top_matches <- tryCatch({
-                    sorted_similarities <- sort(similarities, decreasing = TRUE)
-                    head(sorted_similarities, 5)
+                    sort(similarities, decreasing = TRUE)
                   }, error = function(e) {
                     message("Error sorting similarities: ", e$message)
                     return(numeric(0))
                   })
 
                   if (length(top_matches) > 0 && top_matches[1] > 0.7) {
-                    message("\nData structure name not found in NDA dictionary. Did you mean one of these?")
-                    for (i in seq_along(top_matches)) {
-                      match_name <- names(top_matches)[i]
-                      match_score <- top_matches[i]
-                      message(sprintf("%d. %s (%.1f%% match)", i, match_name, match_score * 100))
-                    }
-
-                    use_suggested <- readline(prompt = "Use one of these instead? (enter number or 'n' to keep original): ")
-
-                    if (grepl("^[0-9]+$", use_suggested)) {
-                      selection <- as.numeric(use_suggested)
-                      if (selection >= 1 && selection <= length(top_matches)) {
-                        script_name <- names(top_matches)[selection]
-                        message(sprintf("Using '%s' instead", script_name))
-                        return(script_name)
+                    message("Data structure name not found in NDA dictionary. Did you mean one of these?")
+                    # Paginated selector: show 5 at a time, support n(ext)/p(rev)/m(anual)/number
+                    page_size <- 5
+                    total <- length(top_matches)
+                    page <- 1
+                    repeat {
+                      start_idx <- (page - 1) * page_size + 1
+                      end_idx <- min(page * page_size, total)
+                      cat(sprintf("\nShowing matches %d-%d of %d:\n", start_idx, end_idx, total))
+                      for (i in seq(start_idx, end_idx)) {
+                        local_num <- i - start_idx + 1
+                        match_name <- names(top_matches)[i]
+                        match_score <- top_matches[i]
+                        message(sprintf("%d. %s (%.1f%% match)", local_num, match_name, match_score * 100))
                       }
+                      prompt_msg <- "Select 1-5, 'n' next, 'p' prev, 'm' manual, Enter keep original, Esc quit: "
+                      use_suggested <- tryCatch({
+                        readline(prompt = prompt_msg)
+                      }, interrupt = function(e) {
+                        message("Interactive selection cancelled (Esc pressed). Keeping original.")
+                        ""  # Treat as keep original
+                      })
+                      # Keep original if empty
+                      if (use_suggested == "") {
+                        break
+                      }
+                      # Manual entry
+                      if (tolower(use_suggested) == "m") {
+                        manual <- readline(prompt = "Enter NDA structure shortName manually (or Enter to cancel): ")
+                        if (nzchar(manual)) {
+                          script_name <- manual
+                          message(sprintf("Using '%s' (manual entry)", script_name))
+                          return(script_name)
+                        } else {
+                          next
+                        }
+                      }
+                      # Next/Prev navigation
+                      if (tolower(use_suggested) == "n") {
+                        if (page * page_size < total) {
+                          page <- page + 1
+                        } else {
+                          message("Already at last page")
+                        }
+                        next
+                      }
+                      if (tolower(use_suggested) == "p") {
+                        if (page > 1) {
+                          page <- page - 1
+                        } else {
+                          message("Already at first page")
+                        }
+                        next
+                      }
+                      # Numeric selection within current page
+                      if (grepl("^[0-9]+$", use_suggested)) {
+                        selection_local <- as.numeric(use_suggested)
+                        if (!is.na(selection_local) && selection_local >= 1 && selection_local <= (end_idx - start_idx + 1)) {
+                          global_index <- start_idx + selection_local - 1
+                          script_name <- names(top_matches)[global_index]
+                          message(sprintf("Using '%s' instead", script_name))
+                          return(script_name)
+                        } else {
+                          message(sprintf("Please enter a number between 1 and %d", (end_idx - start_idx + 1)))
+                          next
+                        }
+                      }
+                      message("Invalid input. Please choose 1-5, 'n', 'p', 'm', or Enter.")
                     }
                   } else {
                     message(sprintf("Warning: '%s' not found in NDA data dictionary and no close matches found", script_name))
                     proceed <- readline(prompt = "Proceed anyway? (y/n): ")
+                    # Check that proceed was given a valid y or n response
+                    while (!tolower(proceed) %in% c("y", "n")){
+                      proceed <- readline(prompt = "Please enter either y or n: ")
+                    }
                     if (tolower(proceed) == "y") {
                       return(script_name)  # Return the original name
                     } else {
@@ -259,6 +333,9 @@ nda <- function(..., csv = FALSE, rdata = FALSE, spss = FALSE, limited_dataset =
 
           message(sprintf("Warning: Unable to validate '%s' against NDA data dictionary", script_name))
           proceed <- readline(prompt = "Proceed anyway? (y/n): ")
+          while (!tolower(proceed) %in% c("y", "n")){
+            proceed <- readline(prompt = "Please enter either y or n: ")
+          }
           if (tolower(proceed) == "y") {
             return(script_name)  # Return the original name
           } else {
@@ -269,19 +346,24 @@ nda <- function(..., csv = FALSE, rdata = FALSE, spss = FALSE, limited_dataset =
         # Validate the script name
         validated_name <- validate_script_name(script_name)
 
-        if (is.logical(validated_name) && !validated_name) {
+        if (is.logical(validated_name) && !validated_name) { # Only runs if validation fails
           message("Script creation cancelled due to validation failure.")
+          # Store current original (script) name in failed_validations
+          failed_validations <- c(failed_validations, original_name)
           next  # Skip this script and continue with the next one
         } else if (is.character(validated_name)) {
           # A different name was selected
           script_name <- validated_name
         }
 
+        # Track name changes after validated name is stored in script_name
+        name_changes[[original_name]] <- script_name
+
         # If script passes validation, allow user to select api:
         api_selection <- function() {
-          options <- c("csv", "mongo", "qualtrics", "redcap", "sql")
+          options <- c("csv", "mongo", "qualtrics", "redcap", "oracle", "sql")
 
-          cat("Select script type (choose only one):\n")
+          cat("\nSelect script type (choose only one):\n")
 
           for (i in 1:length(options)) {
             cat(i, ":", options[i], "\n")
@@ -296,6 +378,7 @@ nda <- function(..., csv = FALSE, rdata = FALSE, spss = FALSE, limited_dataset =
           }
 
           # Return the selected API
+          cat("\n") # Improve spacing and readability
           return(options[choice])
         }
 
@@ -321,7 +404,7 @@ nda <- function(..., csv = FALSE, rdata = FALSE, spss = FALSE, limited_dataset =
               "#",
               "# get collection from MongoDB",
               "# IMPORTANT: both variable name and script filename must match",
-              sprintf("%s <- mongo(\"%s\")", script_name, script_name),
+              sprintf("%s <- mongo(\"%s\")", script_name, original_name),
               "",
               "# nda remediation code...",
               "",
@@ -345,7 +428,7 @@ nda <- function(..., csv = FALSE, rdata = FALSE, spss = FALSE, limited_dataset =
               "#",
               "# get survey from Qualtrics",
               "# IMPORTANT: both variable name and script filename must match",
-              sprintf("%s <- qualtrics(\"%s\")", script_name, script_name),
+              sprintf("%s <- qualtrics(\"%s\")", script_name, original_name),
               "",
               "# nda remediation code...",
               "",
@@ -368,7 +451,30 @@ nda <- function(..., csv = FALSE, rdata = FALSE, spss = FALSE, limited_dataset =
               "#",
               "# get the instrument_name from REDCap",
               "# IMPORTANT: both variable name and script filename must match the NDA data structure alias",
-              sprintf("%s <- redcap(\"%s\")", script_name, script_name),
+              sprintf("%s <- redcap(\"%s\")", script_name, original_name),
+              "",
+              "# nda remediation code...",
+              "",
+              "# IMPORTANT: final df name must still match the NDA data structure alias",
+              "",
+              sep = "\n"
+            )
+          ),
+          oracle = list(
+            path = sprintf(file.path(path, "nda", "oracle", "%s.R"), script_name),  # Added .R extension
+            content = paste(
+              "#",
+              sprintf("# nda/oracle/%s.R", script_name),
+              "#",
+              "# config:  coming soon...",
+              "# secrets: coming soon...",
+              "#",
+              "# return a list of the table(s) from ORACLE",
+              "# oracle.index()",
+              "#",
+              "# get the table data from ORACLE",
+              "# IMPORTANT: both variable name and script filename must match the NDA data structure alias",
+              sprintf("%s <- oracle(\"%s\")", script_name, original_name),
               "",
               "# nda remediation code...",
               "",
@@ -391,7 +497,7 @@ nda <- function(..., csv = FALSE, rdata = FALSE, spss = FALSE, limited_dataset =
               "#",
               "# get the table data from SQL",
               "# IMPORTANT: both variable name and script filename must match the NDA data structure alias",
-              sprintf("%s <- sql(\"%s\")", script_name, script_name),
+              sprintf("%s <- sql(\"%s\")", script_name, original_name),
               "",
               "# nda remediation code...",
               "",
@@ -408,7 +514,7 @@ nda <- function(..., csv = FALSE, rdata = FALSE, spss = FALSE, limited_dataset =
               "#",
               "# get the data from CSV file",
               "# IMPORTANT: both variable name and script filename must match the NDA data structure alias",
-              sprintf("%s <- read.csv(\"%s\".csv)", script_name, script_name),
+              sprintf("%s <- read.csv(\"%s.csv\")", script_name, original_name),
               "",
               "# nda remediation code...",
               "",
@@ -443,10 +549,27 @@ nda <- function(..., csv = FALSE, rdata = FALSE, spss = FALSE, limited_dataset =
     redcap_list <<- tools::file_path_sans_ext(list.files("./nda/redcap"))
     qualtrics_list <<- tools::file_path_sans_ext(list.files("./nda/qualtrics"))
     mongo_list <<- tools::file_path_sans_ext(list.files("./nda/mongo"))
+    oracle_list <<- tools::file_path_sans_ext(list.files("./nda/oracle"))
     sql_list <<- tools::file_path_sans_ext(list.files("./nda/sql"))
 
+    # Update data_list with validated names if necessary (only if name_changes is not empty)
+    if (length(name_changes) > 0) {
+      for (original_name in names(name_changes)) {
+        new_name <- name_changes[[original_name]]
+        if (original_name != new_name) {
+          # Replace the original name with the new name in data_list
+          data_list[data_list == original_name] <- new_name
+        }
+      }
+    }
 
-    # Return the data_list invisibly instead of stopping execution
+    # Remove failed validations (scripts) from data_list if they exist
+    # This will make sure unvalidated scripts are not processed later on
+    if (length(failed_validations) > 0) {
+      data_list <- data_list[!data_list %in% failed_validations]
+    }
+
+    # Return the updated data_list and name_changes invisibly instead of stopping execution
     return(invisible(data_list))
   }
 
@@ -463,7 +586,11 @@ nda <- function(..., csv = FALSE, rdata = FALSE, spss = FALSE, limited_dataset =
   }
 
   # Validate measures and potentially create new scripts
-  validateMeasures(data_list)
+  # Validation results contains data_list (updated if necessary)
+  validation_results <- validateMeasures(data_list)
+
+  # Update data_list with validated names in main function call (for invalid structures if neccessary)
+  data_list <- validation_results # This where data_list is updated globally if necessary
 
   # Process each measure using processNda function
   for (measure in data_list) {
@@ -475,7 +602,8 @@ nda <- function(..., csv = FALSE, rdata = FALSE, spss = FALSE, limited_dataset =
       api <- ifelse(measure %in% redcap_list, "redcap",
                     ifelse(measure %in% qualtrics_list, "qualtrics",
                            ifelse(measure %in% mongo_list, "mongo",
-                                  ifelse(measure %in% sql_list, "sql", "csv"))))
+                                  ifelse(measure %in% oracle_list, "oracle",
+                                         ifelse(measure %in% sql_list, "sql", "csv")))))
     }
 
     processNda(measure, api, csv, rdata, spss, identifier, start_time, limited_dataset)
@@ -489,6 +617,27 @@ nda <- function(..., csv = FALSE, rdata = FALSE, spss = FALSE, limited_dataset =
 processNda <- function(measure, api, csv, rdata, spss, identifier, start_time, limited_dataset = FALSE) {
   # Store the origin environment (the one that called this function)
   origin_env <- parent.frame()
+
+  # Add message to user to signify which data structure is being processed
+  # This will help when iterating through multiple data structures
+
+  # Create dynamic border length based on the length of the data structure name (measure)
+  # 24 is the length of the preceeding message "Processing NDA Structure:"
+  border_length <- 27 + nchar(measure)
+  border <- paste(rep("=", border_length), collapse = "")
+
+  # Format api name for processing message
+  api_formatted <- switch(api,
+                          redcap = "REDCap",
+                          qualtrics = "Qualtrics",
+                          mongo = "MongoDB",
+                          oracle = "Oracle",
+                          sql = "SQL",
+                          csv = "CSV",
+                          api)
+
+  # Use dynamic border and formatted api name in message
+  message(sprintf("\n%s\n Processing NDA Structure: %s \n Data source: %s\n%s\n", border, measure, api_formatted, border))
 
   # Add debugging flag
   DEBUG <- FALSE
@@ -513,7 +662,7 @@ processNda <- function(measure, api, csv, rdata, spss, identifier, start_time, l
 
   # Construct the path to the measure's cleaning script
   file_path <- sprintf("./nda/%s/%s.R", api, measure)
-  message("\nFetching ", measure, " with ./nda/", api, "/", measure,".R\n")
+  message("Fetching ", measure, " with ./nda/", api, "/", measure, ".R\n")
 
   # Setup cleanup on exit
   on.exit({
@@ -533,30 +682,37 @@ processNda <- function(measure, api, csv, rdata, spss, identifier, start_time, l
 
   result <- tryCatch({
     if (DEBUG) message("[DEBUG] Sourcing script file: ", file_path)
-    base::source(file_path)  # Execute the cleaning script for the measure
+    base::source(file_path)
 
-    # Initialize the wizaRdry environment if it doesn't exist
+    # Initialize environments...
     if (!exists(".wizaRdry_env")) {
       if (DEBUG) message("[DEBUG] Creating .wizaRdry_env")
       .wizaRdry_env <- new.env(parent = globalenv())
     }
 
-    # Get the data frame from global environment
+    # Get the data frame
     if (DEBUG) message("[DEBUG] Attempting to get dataframe: ", measure)
     df <- base::get0(measure)
 
-    # Only process if df exists and is a data frame
+    # Store required metadata for later use
+    required_field_metadata <- NULL
+
     if (!is.null(df) && is.data.frame(df)) {
       if (DEBUG) {
         message("[DEBUG] Found dataframe, dims: ", nrow(df), "x", ncol(df))
-        message("[DEBUG] First 10 column names: ", paste(names(df)[1:min(10, ncol(df))], collapse=", "))
       }
 
-      # Reassign the processed data frame to both environments
+      # ADD REQUIRED AND RECOMMENDED ELEMENTS
+      enhancement_result <- addNdarSubjectElements(df, measure)
+      df <- enhancement_result$df
+      required_field_metadata <- enhancement_result$required_metadata
+      recommended_field_metadata <- enhancement_result$recommended_metadata  # NEW
+
+      # Update environments
+      base::assign(measure, df, envir = globalenv())
       base::assign(measure, df, envir = .wizaRdry_env)
-      if (DEBUG) message("[DEBUG] Assigned to .wizaRdry_env")
-    } else {
-      if (DEBUG) message("[DEBUG] Warning: dataframe not found or not a data.frame")
+
+      if (DEBUG) message("[DEBUG] Enhanced dataframe with required and recommended elements")
     }
 
     if (api == "qualtrics") {
@@ -636,6 +792,79 @@ processNda <- function(measure, api, csv, rdata, spss, identifier, start_time, l
 
     }
 
+    if (api == "redcap") {
+      if (DEBUG) message("[DEBUG] Processing as REDCap data")
+
+      # Re-get the data to ensure we have the latest version
+      if (DEBUG) message("[DEBUG] Re-getting dataframe from environment")
+      if (exists(measure, envir = globalenv())) {
+        df <- base::get(measure, envir = globalenv())
+        if (DEBUG) message("[DEBUG] Got from globalenv()")
+      } else if (exists(measure, envir = .wizaRdry_env)) {
+        df <- base::get(measure, envir = .wizaRdry_env)
+        if (DEBUG) message("[DEBUG] Got from .wizaRdry_env")
+      } else if (exists(measure, envir = origin_env)) {
+        df <- base::get(measure, envir = origin_env)
+        if (DEBUG) message("[DEBUG] Got from origin_env")
+      } else {
+        if (DEBUG) message("[DEBUG] ERROR: Can't find dataframe in any environment")
+        stop(paste("Object", measure, "not found in any environment"))
+      }
+
+
+      # Define config so you can access primary key
+      config <- validate_config()
+
+      # Remove specified REDCap columns, including configured primary key
+      cols_to_remove <- c(config$redcap$primary_key, "redcap_event_name")
+
+      if (DEBUG) {
+        message("[DEBUG] Current columns: ", paste(names(df), collapse=", "))
+        intersection <- intersect(names(df), cols_to_remove)
+        message("[DEBUG] Columns to remove (", length(intersection), "): ", paste(intersection, collapse=", "))
+      }
+
+      # Remove the columns - different approach
+      cols_to_keep <- setdiff(names(df), cols_to_remove)
+      if (DEBUG) message("[DEBUG] Columns to keep (", length(cols_to_keep), "): ", paste(head(cols_to_keep, 10), collapse=", "), "...")
+
+      # Create a new dataframe with only the columns to keep
+      df_new <- df[, cols_to_keep, drop = FALSE]
+
+      if (DEBUG) {
+        message("[DEBUG] After removal: ", ncol(df_new), " columns remain")
+        message("[DEBUG] New columns: ", paste(names(df_new), collapse=", "))
+      }
+
+      # Reassign the filtered dataframe to BOTH environments
+      if (DEBUG) message("[DEBUG] Assigning filtered dataframe back to environments")
+
+      # Update in globalenv
+      base::assign(measure, df_new, envir = globalenv())
+      if (DEBUG) message("[DEBUG] Assigned to globalenv()")
+
+      # Update in origin_env
+      base::assign(measure, df_new, envir = origin_env)
+      if (DEBUG) message("[DEBUG] Assigned to origin_env")
+
+      # Update in .wizaRdry_env if it exists
+      if (exists(".wizaRdry_env")) {
+        base::assign(measure, df_new, envir = .wizaRdry_env)
+        if (DEBUG) message("[DEBUG] Assigned to .wizaRdry_env")
+      }
+
+      # Update our local df variable for continuing the function
+      df <- df_new
+
+      # Verify the changes took effect
+      if (DEBUG) {
+        if (exists(measure, envir = globalenv())) {
+          df_check <- base::get(measure, envir = globalenv())
+          message("[DEBUG] Verification - globalenv columns: ", paste(head(names(df_check), 5), collapse=", "), "...")
+        }
+      }
+    }
+
     if (api == "mongo") {
       if (DEBUG) message("[DEBUG] Processing as Mongo data")
 
@@ -706,6 +935,26 @@ processNda <- function(measure, api, csv, rdata, spss, identifier, start_time, l
 
     }
 
+    # Normalize specific values prior to validation (e.g., race mapping)
+    # Difference between NIH reporting and ndar_subject01
+    if (!is.null(df) && is.data.frame(df) && "race" %in% names(df)) {
+      # Ensure character for safe replacement
+      if (is.factor(df$race)) df$race <- as.character(df$race)
+      df$race <- trimws(df$race)
+      # Map NDA-disallowed label to allowed value
+      idx <- which(!is.na(df$race) & df$race == "Native Hawaiian or Pacific Islander")
+      if (length(idx) > 0) {
+        df$race[idx] <- "Hawaiian or Pacific Islander"
+        # Propagate updates to environments used downstream
+        base::assign(measure, df, envir = globalenv())
+        base::assign(measure, df, envir = origin_env)
+        if (exists(".wizaRdry_env")) {
+          base::assign(measure, df, envir = .wizaRdry_env)
+        }
+        message(sprintf("Normalized %d 'race' value(s) to 'Hawaiian or Pacific Islander'", length(idx)))
+      }
+    }
+
     # show missing data that needs filled
     if (DEBUG) message("[DEBUG] Checking for missing data in required fields")
     missing_data <- df[is.na(df$src_subject_id) | is.na(df$subjectkey) | is.na(df$interview_age) | is.na(df$interview_date) | is.na(df$sex), ]
@@ -716,34 +965,129 @@ processNda <- function(measure, api, csv, rdata, spss, identifier, start_time, l
 
     # Re-integrate ndaValidator with proper environment management
     if (DEBUG) message("[DEBUG] Running validation")
-    validation_results <- ndaValidator(measure, api, limited_dataset)
 
-    # CRITICAL: Update all environments with validated dataframe
-    if (is.list(validation_results) && !is.null(validation_results$df)) {
-      if (DEBUG) message("[DEBUG] Updating environments with validated dataframe")
-      # Update globalenv
-      base::assign(measure, validation_results$df, envir = globalenv())
-      if (DEBUG) message("[DEBUG] Updated globalenv()")
+    # First check if NDA structure exists
+    nda_structure_exists <- TRUE
+    nda_structure <- NULL
 
-      # Update origin_env
-      base::assign(measure, validation_results$df, envir = origin_env)
-      if (DEBUG) message("[DEBUG] Updated origin_env")
+    tryCatch({
+      nda_base_url <- "https://nda.nih.gov/api/datadictionary/v2"
+      url <- sprintf("%s/datastructure/%s", nda_base_url, measure)
 
-      # Update wizaRdry_env
-      if (exists(".wizaRdry_env")) {
-        base::assign(measure, validation_results$df, envir = .wizaRdry_env)
-        if (DEBUG) message("[DEBUG] Updated .wizaRdry_env")
+      response <- httr::GET(url, httr::timeout(10))
+
+      if (httr::status_code(response) == 200) {
+        raw_content <- rawToChar(response$content)
+        if (nchar(raw_content) > 0) {
+          nda_structure <- jsonlite::fromJSON(raw_content)
+          if (!"dataElements" %in% names(nda_structure)) {
+            nda_structure_exists <- FALSE
+          }
+        } else {
+          nda_structure_exists <- FALSE
+        }
+      } else if (httr::status_code(response) == 404) {
+        nda_structure_exists <- FALSE
+        message(sprintf("\nNDA structure '%s' not found in data dictionary - treating as new structure", measure))
+      } else {
+        nda_structure_exists <- FALSE
+        message(sprintf("Could not validate NDA structure '%s' (status: %d) - treating as new structure",
+                        measure, httr::status_code(response)))
+      }
+    }, error = function(e) {
+      nda_structure_exists <- FALSE
+      message(sprintf("Network error checking NDA structure '%s' - treating as new structure: %s",
+                      measure, e$message))
+    })
+
+    if (nda_structure_exists && !is.null(nda_structure)) {
+
+      # *** ADD THIS NEW CODE HERE ***
+      # Enhance existing structure with ndar_subject01 metadata BEFORE validation
+      if (!is.null(required_field_metadata) || !is.null(recommended_field_metadata)) {
+        message("Enhancing existing NDA structure with ndar_subject01 metadata...")
+        nda_structure <- mergeNdarSubjectIntoExisting(nda_structure, required_field_metadata, recommended_field_metadata)
+      }
+      # *** END NEW CODE ***
+
+      # EXISTING NDA STRUCTURE - Run full validation
+      validation_results <- ndaValidator(measure, api, limited_dataset, modified_structure = nda_structure)
+
+      # ADD BOTH METADATA ATTRIBUTES
+      if (!is.null(required_field_metadata)) {
+        attr(validation_results, "required_metadata") <- required_field_metadata
+      }
+      if (!is.null(recommended_field_metadata)) {
+        attr(validation_results, "recommended_metadata") <- recommended_field_metadata
       }
 
-      # Update our local df variable
-      df <- validation_results$df
-      if (DEBUG) message("[DEBUG] Updated local df variable")
-    }
+      # CRITICAL: Update all environments with validated dataframe
+      if (is.list(validation_results) && !is.null(validation_results$df)) {
+        if (DEBUG) message("[DEBUG] Updating environments with validated dataframe")
+        # Update globalenv
+        base::assign(measure, validation_results$df, envir = globalenv())
+        if (DEBUG) message("[DEBUG] Updated globalenv()")
+        # Update origin_env
+        base::assign(measure, validation_results$df, envir = origin_env)
+        if (DEBUG) message("[DEBUG] Updated origin_env")
+        # Update wizaRdry_env
+        if (exists(".wizaRdry_env")) {
+          base::assign(measure, validation_results$df, envir = .wizaRdry_env)
+          if (DEBUG) message("[DEBUG] Updated .wizaRdry_env")
+        }
+        # Update our local df variable
+        df <- validation_results$df
+        if (DEBUG) message("[DEBUG] Updated local df variable")
+      }
 
-    # Also re-enable the validation sound alert
-    if (exists("validation_results") && is.list(validation_results)) {
-      if (DEBUG) message("[DEBUG] Playing validation sound")
-      ifelse(validation_results$valid, "mario", "wilhelm") |> beepr::beep()
+      # Defer any sounds until the end of processing
+
+      # Create data upload template ONLY for existing structures
+      if (DEBUG) message("[DEBUG] Creating NDA template")
+      createNdaSubmissionTemplate(measure)
+
+    } else {
+      # NEW STRUCTURE - Bypass validation, create minimal results
+      message(sprintf("\nSkipping NDA validation for new structure '%s'", measure))
+      message("Proceeding with data definition creation using computed metadata only")
+
+      # Create minimal validation results for compatibility
+      validation_results <- list(
+        valid = TRUE,  # Always valid for new structures
+        df = base::get0(measure),
+        message = paste("New data structure:", measure, "- no NDA validation performed"),
+        bypassed_validation = TRUE
+      )
+
+      # Create a mock NDA structure for data definition creation
+      df <- base::get0(measure)
+      if (!is.null(df) && is.data.frame(df)) {
+        # Create minimal structure that will force all fields to be computed
+        nda_structure <- list(
+          shortName = measure,
+          dataElements = data.frame(
+            name = character(0),
+            type = character(0),
+            description = character(0),
+            required = character(0),
+            stringsAsFactors = FALSE
+          )
+        )
+        # Store as attribute for data definition creation
+        attr(validation_results, "nda_structure") <- nda_structure
+      }
+
+      if (!is.null(required_field_metadata)) {
+        # Enhance with both required and recommended metadata
+        enhanced_structure <- mergeRequiredMetadata(nda_structure, required_field_metadata, recommended_field_metadata)
+        attr(validation_results, "nda_structure") <- enhanced_structure
+        message("Enhanced new structure with complete ndar_subject01 required and recommended field metadata")
+      }
+
+      # Defer any sounds until the end of processing
+
+      # DO NOT CREATE SUBMISSION TEMPLATE FOR NEW STRUCTURES
+      message("Skipping submission template creation for new structure")
     }
 
     # Now apply date format preservation AFTER validation
@@ -756,9 +1100,41 @@ processNda <- function(measure, api, csv, rdata, spss, identifier, start_time, l
     }
 
     # Create data upload template regardless of if test passes
-    if (DEBUG) message("[DEBUG] Creating NDA template")
-    createNda(measure)
+    # if (DEBUG) message("[DEBUG] Creating NDA template")
+    # createNdaSubmissionTemplate(measure)
+
+    # Create data definition
+    if (DEBUG) message("[DEBUG] Creating NDA data definition")
+    tryCatch({
+      df <- base::get0(measure)
+      if (!is.null(df) && is.data.frame(df) &&
+          exists("validation_results") && is.list(validation_results)) {
+
+        # Get NDA structure from validation results attribute
+        nda_structure <- attr(validation_results, "nda_structure")
+
+        if (!is.null(nda_structure)) {
+          submission_template <- list(columns = names(df))
+          createNdaDataDefinition(submission_template, nda_structure, measure)
+        } else {
+          message("NDA structure not available from validation results")
+        }
+      }
+    }, error = function(e) {
+      message("Error creating data definition: ", e$message)
+    })
+
     formatElapsedTime(start_time)
+
+    # Play completion sound AFTER all processing, including data definition export
+    if (exists("validation_results") && is.list(validation_results)) {
+      # Use success/fail tone for existing structures; treasure for new (bypassed) ones
+      tone <- if (isTRUE(validation_results$bypassed_validation)) "treasure" else if (isTRUE(validation_results$valid)) "mario" else "wilhelm"
+      if (DEBUG) message("[DEBUG] Playing completion sound: ", tone)
+      try(beepr::beep(tone), silent = TRUE)
+    } else {
+      try(beepr::beep("treasure"), silent = TRUE)
+    }
   }, error = function(e) {
     if (DEBUG) message("[DEBUG] Error caught: ", e$message)
     # Check if identifier is valid
@@ -787,8 +1163,354 @@ processNda <- function(measure, api, csv, rdata, spss, identifier, start_time, l
   return(result)  # Return the result of the processing
 }
 
+addNdarSubjectElements <- function(df, measure) {
+  # Initialize return structure
+  result <- list(
+    df = df,
+    required_metadata = NULL,
+    recommended_metadata = NULL
+  )
+
+  tryCatch({
+    message("Fetching required and recommended elements from ndar_subject01 API...")
+
+    nda_base_url <- "https://nda.nih.gov/api/datadictionary/v2"
+    url <- sprintf("%s/datastructure/ndar_subject01", nda_base_url)
+
+    response <- httr::GET(url, httr::timeout(10))
+
+    if (httr::status_code(response) == 200) {
+      raw_content <- rawToChar(response$content)
+      if (nchar(raw_content) > 0) {
+        subject_structure <- jsonlite::fromJSON(raw_content)
+
+        if ("dataElements" %in% names(subject_structure)) {
+          # Get REQUIRED elements (ALL of them)
+          required_elements <- subject_structure$dataElements[
+            subject_structure$dataElements$required == "Required",
+          ]
+
+          # Get RECOMMENDED elements (ALL of them initially)
+          all_recommended_elements <- subject_structure$dataElements[
+            subject_structure$dataElements$required == "Recommended",
+          ]
+
+          # Filter RECOMMENDED to only those that exist in BOTH ndar_subject01 AND the dataframe
+          common_recommended_names <- intersect(all_recommended_elements$name, names(df))
+          recommended_elements <- all_recommended_elements[
+            all_recommended_elements$name %in% common_recommended_names,
+          ]
 
 
+          message(sprintf("Found %d required elements from ndar_subject01 (will process ALL)", nrow(required_elements)))
+          message(sprintf("Found %d recommended elements in ndar_subject01, %d are common with dataframe (will process COMMON only)",
+                          nrow(all_recommended_elements), nrow(recommended_elements)))
+
+          if (nrow(recommended_elements) > 0) {
+            message(sprintf("Common recommended fields: %s",
+                            paste(recommended_elements$name, collapse = ", ")))
+          } else {
+            message("No common recommended fields found between ndar_subject01 and dataframe")
+          }
+
+          # PRESERVE ALL METADATA for required and COMMON recommended only
+          result$required_metadata <- required_elements
+          result$recommended_metadata <- recommended_elements  # Only common ones
+
+          # Process ALL REQUIRED elements (add missing, ensure correct types)
+          message("\n--- Processing ALL REQUIRED fields ---")
+          for (i in 1:nrow(required_elements)) {
+            col_name <- required_elements$name[i]
+            col_type <- required_elements$type[i]
+
+            message(sprintf("Processing required field: %s (%s)", col_name, col_type))
+
+            # Determine R data type
+            if (grepl("String|GUID", col_type, ignore.case = TRUE)) {
+              default_value <- NA_character_
+              conversion_func <- as.character
+            } else if (grepl("Integer", col_type, ignore.case = TRUE)) {
+              default_value <- NA_integer_
+              conversion_func <- as.integer
+            } else if (grepl("Float", col_type, ignore.case = TRUE)) {
+              default_value <- NA_real_
+              conversion_func <- as.numeric
+            } else if (grepl("Date", col_type, ignore.case = TRUE)) {
+              default_value <- NA_character_
+              conversion_func <- as.character
+            } else {
+              default_value <- NA_character_
+              conversion_func <- as.character
+            }
+
+            if (col_name %in% names(df)) {
+              # Column exists - preserve existing values but ensure correct type
+              existing_data <- df[[col_name]]
+              non_na_count <- sum(!is.na(existing_data))
+
+              if (non_na_count > 0) {
+                message(sprintf("  - Field exists with %d values, ensuring %s type",
+                                non_na_count, col_type))
+                df[[col_name]] <- tryCatch({
+                  conversion_func(existing_data)
+                }, error = function(e) {
+                  message(sprintf("    Warning: Type conversion failed for %s", col_name))
+                  existing_data
+                })
+              } else {
+                message(sprintf("  - Field exists but empty, setting to %s type", col_type))
+                df[[col_name]] <- rep(default_value, nrow(df))
+              }
+            } else {
+              # Column doesn't exist - add it (REQUIRED fields are always added)
+              message(sprintf("  - Adding new required field as %s type", col_type))
+              df[[col_name]] <- rep(default_value, nrow(df))
+            }
+          }
+
+          # Process ONLY COMMON RECOMMENDED elements
+          if (nrow(recommended_elements) > 0) {
+            message("\n--- Processing COMMON RECOMMENDED fields ---")
+            for (i in 1:nrow(recommended_elements)) {
+              col_name <- recommended_elements$name[i]
+              col_type <- recommended_elements$type[i]
+
+              message(sprintf("Processing common recommended field: %s (%s)", col_name, col_type))
+
+              # Determine R data type (same logic as required)
+              if (grepl("String|GUID", col_type, ignore.case = TRUE)) {
+                default_value <- NA_character_
+                conversion_func <- as.character
+              } else if (grepl("Integer", col_type, ignore.case = TRUE)) {
+                default_value <- NA_integer_
+                conversion_func <- as.integer
+              } else if (grepl("Float", col_type, ignore.case = TRUE)) {
+                default_value <- NA_real_
+                conversion_func <- as.numeric
+              } else if (grepl("Date", col_type, ignore.case = TRUE)) {
+                default_value <- NA_character_
+                conversion_func <- as.character
+              } else {
+                default_value <- NA_character_
+                conversion_func <- as.character
+              }
+
+              # Since we filtered for common fields, we know the column exists
+              # Just ensure correct type and preserve existing values
+              existing_data <- df[[col_name]]
+              non_na_count <- sum(!is.na(existing_data))
+
+              if (non_na_count > 0) {
+                message(sprintf("  - Field exists with %d values, ensuring %s type",
+                                non_na_count, col_type))
+                df[[col_name]] <- tryCatch({
+                  conversion_func(existing_data)
+                }, error = function(e) {
+                  message(sprintf("    Warning: Type conversion failed for %s", col_name))
+                  existing_data
+                })
+              } else {
+                message(sprintf("  - Field exists but empty, setting to %s type", col_type))
+                df[[col_name]] <- rep(default_value, nrow(df))
+              }
+            }
+          } else {
+            message("\n--- No common recommended fields to process ---")
+          }
+
+          # Reorder columns: REQUIRED first, then COMMON RECOMMENDED, then others
+          required_field_names <- required_elements$name
+          recommended_field_names <- recommended_elements$name  # Only common ones
+          other_field_names <- setdiff(names(df), c(required_field_names, recommended_field_names))
+
+          present_required <- intersect(required_field_names, names(df))
+          present_recommended <- intersect(recommended_field_names, names(df))
+
+          df <- df[, c(present_required, present_recommended, other_field_names)]
+          result$df <- df
+
+          message("\nSuccessfully processed ndar_subject01 elements")
+          message(sprintf("Required fields (%d): %s",
+                          length(present_required), paste(present_required, collapse = ", ")))
+          if (length(present_recommended) > 0) {
+            message(sprintf("Common recommended fields (%d): %s",
+                            length(present_recommended), paste(present_recommended, collapse = ", ")))
+          } else {
+            message("Common recommended fields (0): none")
+          }
+
+        } else {
+          message("No dataElements found in ndar_subject01 API response")
+        }
+      } else {
+        message("Empty response from ndar_subject01 API")
+      }
+    } else {
+      message(sprintf("Failed to fetch ndar_subject01 from API (status: %d)", httr::status_code(response)))
+    }
+
+  }, error = function(e) {
+    message("Error fetching ndar_subject01 from API: ", e$message)
+    message("Continuing without required/recommended field updates...")
+  })
+
+  return(result)
+}
+
+# Function to merge required metadata into new structure definitions
+mergeRequiredMetadata <- function(new_structure, required_metadata, recommended_metadata = NULL) {
+  if (is.null(required_metadata) || nrow(required_metadata) == 0) {
+    return(new_structure)
+  }
+
+  tryCatch({
+    message("Merging required and recommended ndar_subject01 metadata into new structure...")
+
+    # Combine required and recommended metadata
+    all_metadata <- required_metadata
+    if (!is.null(recommended_metadata) && nrow(recommended_metadata) > 0) {
+      all_metadata <- rbind(required_metadata, recommended_metadata)
+      message(sprintf("Combined %d required + %d recommended = %d total elements",
+                      nrow(required_metadata), nrow(recommended_metadata), nrow(all_metadata)))
+    }
+
+    # For new structures, prepend the combined metadata with their full definitions
+    if (is.null(new_structure$dataElements) || nrow(new_structure$dataElements) == 0) {
+      # No existing elements, use combined metadata as base
+      new_structure$dataElements <- all_metadata
+      message(sprintf("Added %d elements as base structure", nrow(all_metadata)))
+    } else {
+      # Existing elements - merge without overwriting
+      existing_names <- new_structure$dataElements$name
+      combined_names <- all_metadata$name
+
+      # Find elements not already in the structure
+      missing_elements <- all_metadata[!combined_names %in% existing_names, ]
+
+      if (nrow(missing_elements) > 0) {
+        # Prepend missing elements
+        new_structure$dataElements <- rbind(missing_elements, new_structure$dataElements)
+        message(sprintf("Added %d missing elements", nrow(missing_elements)))
+      }
+
+      message("Required and recommended elements preserved with complete metadata")
+    }
+
+  }, error = function(e) {
+    message("Error merging metadata: ", e$message)
+  })
+
+  return(new_structure)
+}
+
+# Enhanced mergeNdarSubjectIntoExisting function to properly override field definitions
+
+mergeNdarSubjectIntoExisting <- function(existing_structure, required_metadata, recommended_metadata) {
+  if (is.null(existing_structure) || is.null(existing_structure$dataElements)) {
+    return(existing_structure)
+  }
+
+  tryCatch({
+    message("Overriding existing structure fields with authoritative ndar_subject01 definitions...")
+
+    # Combine required and recommended metadata from ndar_subject01
+    ndar_metadata <- data.frame()
+    if (!is.null(required_metadata) && nrow(required_metadata) > 0) {
+      ndar_metadata <- rbind(ndar_metadata, required_metadata)
+    }
+    if (!is.null(recommended_metadata) && nrow(recommended_metadata) > 0) {
+      ndar_metadata <- rbind(ndar_metadata, recommended_metadata)
+    }
+
+    if (nrow(ndar_metadata) == 0) {
+      return(existing_structure)
+    }
+
+    # Get existing and ndar field names
+    existing_names <- existing_structure$dataElements$name
+    ndar_names <- ndar_metadata$name
+
+    # Find fields that should be REPLACED with ndar_subject01 definitions
+    fields_to_replace <- intersect(existing_names, ndar_names)
+
+    # Find fields that are completely new from ndar_subject01
+    new_fields <- setdiff(ndar_names, existing_names)
+
+    # Find fields that remain unchanged from original structure
+    unchanged_fields <- setdiff(existing_names, ndar_names)
+
+    message(sprintf("Replacing %d fields with ndar_subject01 definitions: %s",
+                    length(fields_to_replace), paste(head(fields_to_replace, 8), collapse = ", ")))
+
+    if (length(new_fields) > 0) {
+      message(sprintf("Adding %d new ndar_subject01 fields: %s",
+                      length(new_fields), paste(head(new_fields, 5), collapse = ", ")))
+    }
+
+    message(sprintf("Keeping %d original structure fields unchanged: %s",
+                    length(unchanged_fields), paste(head(unchanged_fields, 5), collapse = ", ")))
+
+    # Build the new dataElements in priority order:
+    # 1. REQUIRED fields from ndar_subject01 (first priority)
+    # 2. RECOMMENDED fields from ndar_subject01 (second priority)
+    # 3. Original structure fields that weren't replaced (last)
+
+    new_data_elements <- data.frame()
+
+    # Add REQUIRED fields from ndar_subject01 first
+    if (!is.null(required_metadata) && nrow(required_metadata) > 0) {
+      required_in_structure <- required_metadata[required_metadata$name %in% c(fields_to_replace, new_fields), ]
+      if (nrow(required_in_structure) > 0) {
+        new_data_elements <- rbind(new_data_elements, required_in_structure)
+        message(sprintf("Added %d required fields from ndar_subject01", nrow(required_in_structure)))
+      }
+    }
+
+    # Add RECOMMENDED fields from ndar_subject01 second
+    if (!is.null(recommended_metadata) && nrow(recommended_metadata) > 0) {
+      recommended_in_structure <- recommended_metadata[recommended_metadata$name %in% c(fields_to_replace, new_fields), ]
+      if (nrow(recommended_in_structure) > 0) {
+        new_data_elements <- rbind(new_data_elements, recommended_in_structure)
+        message(sprintf("Added %d recommended fields from ndar_subject01", nrow(recommended_in_structure)))
+      }
+    }
+
+    # Add unchanged original structure fields last
+    unchanged_elements <- existing_structure$dataElements[
+      existing_structure$dataElements$name %in% unchanged_fields,
+    ]
+    if (nrow(unchanged_elements) > 0) {
+      new_data_elements <- rbind(new_data_elements, unchanged_elements)
+      message(sprintf("Preserved %d original structure fields", nrow(unchanged_elements)))
+    }
+
+    # Replace the dataElements with the new prioritized version
+    existing_structure$dataElements <- new_data_elements
+
+    message(sprintf("Enhanced structure now has %d total fields with ndar_subject01 definitions taking priority",
+                    nrow(existing_structure$dataElements)))
+
+    # Show what the key fields now look like
+    key_fields <- c("race", "phenotype", "phenotype_description", "twins_study", "sibling_study")
+    present_key_fields <- intersect(key_fields, existing_structure$dataElements$name)
+    if (length(present_key_fields) > 0) {
+      message("Key ndar_subject01 field definitions now active:")
+      for (field in present_key_fields) {
+        field_def <- existing_structure$dataElements[existing_structure$dataElements$name == field, ]
+        if (nrow(field_def) > 0) {
+          message(sprintf("  - %s: %s (%s) - %s",
+                          field, field_def$type[1], field_def$required[1],
+                          substr(field_def$description[1], 1, 50)))
+        }
+      }
+    }
+
+  }, error = function(e) {
+    message("Error merging ndar_subject01 into existing structure: ", e$message)
+  })
+
+  return(existing_structure)
+}
 
 # Add helper function for MongoDB cleanup
 disconnectMongo <- function(mongo) {
@@ -840,8 +1562,9 @@ formatElapsedTime <- function(start_time) {
   message("Formatted for NDA in ", formatted_time, ".")
 }
 
-#' Alias for 'nda'
+#' Alias for 'nda' (DEPRECATED)
 #'
+#' This function is deprecated. Please use 'nda' instead.
 #' This is a legacy alias for the 'nda' function to maintain compatibility with older code.
 #'
 #' @inheritParams nda
@@ -849,7 +1572,10 @@ formatElapsedTime <- function(start_time) {
 #' @export
 #' @examples
 #' \dontrun{
+#' # DEPRECATED - use nda() instead
 #' prl01 <- ndaRequest("prl01")
 #' }
-ndaRequest <- nda
-
+ndaRequest <- function(...) {
+  .Deprecated("nda", package = "wizaRdry")
+  nda(...)
+}

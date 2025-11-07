@@ -51,7 +51,7 @@ to.sav <- function(df, df_name = NULL, path = ".", skip_prompt = TRUE) { # skip_
   }
 
   # Check for user preferences file
-  user_prefs_file <- file.path(path, "..wizaRdry_prefs")
+  user_prefs_file <- file.path(path, ".wizaRdry_prefs")
   user_prefs <- list(shown_tree = FALSE, auto_create = FALSE, auto_clean = FALSE, auto_nda = FALSE,
                      auto_nda_template = FALSE, auto_csv = FALSE, auto_rds = FALSE, auto_sav = FALSE)
 
@@ -116,17 +116,20 @@ to.sav <- function(df, df_name = NULL, path = ".", skip_prompt = TRUE) { # skip_
   return(invisible(TRUE))
 }
 
-#' Alias for 'to.sav'
+#' Alias for 'to.sav' (DEPRECATED)
 #'
+#' This function is deprecated. Please use 'to.sav' instead.
 #' This is a legacy alias for the 'to.sav' function to maintain compatibility with older code.
 #'
-#' @inheritParams to.sav
+#' @param ... Additional arguments passed through to \code{to.sav()}.
 #' @inherit to.sav return
 #' @export
 #' @examples
 #' \dontrun{
+#' # DEPRECATED - use to.sav() instead
 #' createSpss(prl01)
 #' }
-createSpss <- to.sav
-
-
+createSpss <- function(...) {
+  .Deprecated("to.sav", package = "wizaRdry")
+  to.sav(...)
+}
