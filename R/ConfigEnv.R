@@ -17,7 +17,7 @@ ConfigEnv <- R6::R6Class("ConfigEnv",
                                required = c("superkey", "primary_key")
                              ),
                              sql = list(
-                               required = c("database", "superkey", "primary_key", "pii_fields")
+                               required = c()  # All SQL config settings are optional - superkey/primary_key only needed for auto-joins
                              ),
                              missing_data_codes = list(
                                required = c(),  # No required fields - all are optional
@@ -146,11 +146,13 @@ ConfigEnv <- R6::R6Class("ConfigEnv",
                              all_errors <- c()
                              # Get API specs
                              specs <- self$api_specs[[api_type]]
-                             # Check required fields
-                             for (field in specs$required) {
-                               field_path <- paste0(api_type, ".", field)
-                               if (!self$has_value(field_path)) {
-                                 all_errors <- c(all_errors, paste("Missing '", field, "' setting in the ", api_type, " section"))
+                             # Check required fields (only if any are specified)
+                             if (length(specs$required) > 0) {
+                               for (field in specs$required) {
+                                 field_path <- paste0(api_type, ".", field)
+                                 if (!self$has_value(field_path)) {
+                                   all_errors <- c(all_errors, paste("Missing '", field, "' setting in the ", api_type, " section"))
+                                 }
                                }
                              }
                              # API-specific additional validations

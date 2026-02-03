@@ -4,6 +4,72 @@ NULL
 # Create a package environment to store state between functions
 .pkg_env <- new.env(parent = emptyenv())
 
+#' NDA Super Required Fields
+#'
+#' @description
+#' The 5 mandatory fields required for ALL NDA submissions.
+#' These are always sourced from ndar_subject01 and added to all structures.
+#' 
+#' Order matches NDA documentation convention:
+#' 1. subjectkey - Unique GUID identifier
+#' 2. src_subject_id - Study-specific subject ID
+#' 3. interview_date - Date of data collection
+#' 4. interview_age - Age at interview (months)
+#' 5. sex - Biological sex (M/F/O)
+#'
+#' @keywords internal
+#' @noRd
+SUPER_REQUIRED_FIELDS <- c(
+  "subjectkey",
+  "src_subject_id",
+  "interview_date",
+  "interview_age",
+  "sex"
+)
+
+#' DCC Required Fields
+#'
+#' @description
+#' The 7 required fields from ndar_subject01 that are mandatory for
+#' Data Coordinating Center (DCC) submissions. These fields are only
+#' included when dcc = TRUE.
+#'
+#' @keywords internal
+#' @noRd
+DCC_REQUIRED_FIELDS <- c(
+  "race",
+  "phenotype",
+  "phenotype_description",
+  "twins_study",
+  "sibling_study",
+  "family_study",
+  "sample_taken"
+)
+
+#' DCC Recommended Fields
+#'
+#' @description
+#' The 4 recommended fields from ndar_subject01 for Data Coordinating
+#' Center (DCC) submissions. These fields are only included when dcc = TRUE.
+#'
+#' @keywords internal
+#' @noRd
+DCC_RECOMMENDED_FIELDS <- c(
+  "ethnic_group",
+  "site",
+  "study",
+  "subsiteid"
+)
+
+#' All DCC Fields
+#'
+#' @description
+#' Combined list of all DCC required and recommended fields (11 total).
+#'
+#' @keywords internal
+#' @noRd
+DCC_FIELDS <- c(DCC_REQUIRED_FIELDS, DCC_RECOMMENDED_FIELDS)
+
 .onLoad <- function(libname, pkgname) {
   options(mongolite.quiet = TRUE)
   options(wizaRdry.nda_base_url = "https://nda.nih.gov/api/datadictionary/v2")

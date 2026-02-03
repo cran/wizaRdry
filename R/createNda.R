@@ -19,7 +19,7 @@
 #' @details
 #' The function will:
 #' 1. Create a 'tmp' directory if it doesn't exist
-#' 2. Parse the structure name into base and suffix components (e.g., "eefrt01" → "eefrt" and "01")
+#' 2. Parse the structure name into base and suffix components (e.g., "eefrt01" -> "eefrt" and "01")
 #' 3. Write the structure name components as the first line
 #' 4. Write column headers as the second line
 #' 5. Write the data rows below
@@ -104,7 +104,7 @@ to.nda <- function(df, path = ".", skip_prompt = TRUE) { #set skip_prompt to TRU
   structure_name <- df_name
 
   # Create the file path
-  file_path <- file.path(tmp_path, paste0(structure_name, '_template.csv'))
+  file_path <- file.path(tmp_path, paste0(structure_name, '_submission.csv'))
 
   # Get the data frame
   if (is.character(df)) {

@@ -4,9 +4,23 @@
 \alias{to.nda}
 \title{Create NDA Submission Template}
 \usage{
-to.nda(df, path = ".", skip_prompt = TRUE)
+to.nda(
+  df,
+  path = ".",
+  skip_prompt = TRUE,
+  selected_fields = NULL,
+  skip_prompts = FALSE,
+  verbose = FALSE
+)
 
-to.nda(df, path = ".", skip_prompt = TRUE)
+to.nda(
+  df,
+  path = ".",
+  skip_prompt = TRUE,
+  selected_fields = NULL,
+  skip_prompts = FALSE,
+  verbose = FALSE
+)
 }
 \arguments{
 \item{df}{Data frame to be used as template or character string naming a data frame
@@ -17,6 +31,14 @@ and template file should be created. Defaults to the current working directory.}
 
 \item{skip_prompt}{Logical. If TRUE (default), skips the confirmation prompt. If FALSE,
 will prompt for confirmation unless the user has previously chosen to remember their preference.}
+
+\item{selected_fields}{Character vector of field names to include in template. If NULL (default),
+uses all fields from data frame. Used by create_nda_files() for centralized field selection.}
+
+\item{skip_prompts}{Logical. If TRUE, skip ALL interactive prompts (used when called from
+create_nda_files() with pre-selected fields). Default: FALSE.}
+
+\item{verbose}{Logical. If TRUE, show detailed progress messages. Default: FALSE.}
 }
 \value{
 Invisible TRUE if successful. Creates a CSV file at the specified path
@@ -42,7 +64,7 @@ with an option to remember the user's preference for future calls.
 The function will:
 \enumerate{
 \item Create a 'tmp' directory if it doesn't exist
-\item Parse the structure name into base and suffix components (e.g., "eefrt01" → "eefrt" and "01")
+\item Parse the structure name into base and suffix components (e.g., "eefrt01" -> "eefrt" and "01")
 \item Write the structure name components as the first line
 \item Write column headers as the second line
 \item Write the data rows below
@@ -51,7 +73,7 @@ The function will:
 The function will:
 \enumerate{
 \item Create a 'tmp' directory if it doesn't exist
-\item Parse the structure name into base and suffix components (e.g., "eefrt01" → "eefrt" and "01")
+\item Parse the structure name into base and suffix components (e.g., "eefrt01" -> "eefrt" and "01")
 \item Write the structure name components as the first line
 \item Write column headers as the second line
 \item Write the data rows below

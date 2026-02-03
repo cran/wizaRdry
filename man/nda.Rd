@@ -10,7 +10,10 @@ nda(
   rdata = FALSE,
   spss = FALSE,
   limited_dataset = FALSE,
-  skip_prompt = TRUE
+  skip_prompt = TRUE,
+  verbose = FALSE,
+  strict = TRUE,
+  dcc = FALSE
 )
 }
 \arguments{
@@ -26,6 +29,15 @@ nda(
 
 \item{skip_prompt}{Logical. If TRUE (default), skips confirmation prompts unless preferences aren't set yet. If FALSE,
 prompts for confirmation unless the user has previously chosen to remember their preference.}
+
+\item{verbose}{Logical. If TRUE, shows detailed processing information. If FALSE (default), shows only essential user-facing messages.}
+
+\item{strict}{Logical. If TRUE (default), enforce strict NDA validation: required fields with ANY missing data or
+recommended fields with ALL missing data will cause validation failure. If FALSE (lenient mode), missing data
+triggers warnings but allows processing to continue.}
+
+\item{dcc}{Logical. If TRUE, include 11 DCC (Data Coordinating Center) fields from ndar_subject01
+(7 required + 4 recommended). Default FALSE.}
 }
 \value{
 Prints the time taken for the data request process.
@@ -43,6 +55,15 @@ unit tests to verify that the data quality standards are met.
 
   # Skip confirmation prompts
   nda("prl", csv=TRUE, skip_prompt=TRUE)
+  
+  # Show detailed processing information
+  nda("prl", verbose=TRUE)
+  
+  # Use lenient validation mode (allow missing data with warnings)
+  nda("prl", strict=FALSE)
+  
+  # Include DCC fields from ndar_subject01
+  nda("prl", dcc=TRUE)
 }
 
 }

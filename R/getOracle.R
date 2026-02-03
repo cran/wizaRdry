@@ -1,3 +1,96 @@
+#' Get Oracle connection parameters from secrets
+#'
+#' Retrieves connection parameters (DSN, DBQ, or host) from secrets configuration.
+#' Returns a list indicating which type of connection to use.
+#'
+#' @return A list with `use_dbq` (logical) and `value` (character) elements
+#' @noRd
+get_oracle_connection_params <- function() {
+  # Get connection parameters, supporting both DSN and DBQ (TNS alias)
+  # DBQ is used for TNS aliases from tnsnames.ora (Oracle convention: uppercase)
+  # DSN is used for ODBC Data Source Names (Oracle convention: uppercase)
+  
+  dsn <- get_secret_optional("DSN")
+  dbq <- get_secret_optional("DBQ")
+  host <- get_secret_optional("host")  # Fallback for backward compatibility (lowercase for legacy)
+  
+  # If DBQ is specified, use it (TNS alias)
+  if (!is.null(dbq) && nchar(dbq) > 0) {
+    return(list(use_dbq = TRUE, value = trimws(dbq)))
+  }
+  
+  # If DSN is specified, use it
+  if (!is.null(dsn) && nchar(dsn) > 0) {
+    return(list(use_dbq = FALSE, value = trimws(dsn)))
+  }
+  
+  # Fallback to host (treat as dsn for backward compatibility)
+  if (!is.null(host) && nchar(host) > 0) {
+    return(list(use_dbq = FALSE, value = trimws(host)))
+  }
+  
+  stop("No connection target specified. Please set 'DSN', 'DBQ', or 'host' in secrets.R")
+}
+
+#'
+#' @noRd
+get_oracle_driver <- function(validate = FALSE) {
+  # Try to get driver from secrets first
+  driver <- get_secret_optional("driver")
+  
+  if (!is.null(driver) && nchar(driver) > 0) {
+    # Trim whitespace from driver name
+    driver <- trimws(driver)
+    
+    # If validation requested, check if driver exists (with case-insensitive matching)
+    if (validate && requireNamespace("odbc", quietly = TRUE)) {
+      tryCatch({
+        available_drivers <- odbc::odbcListDrivers()
+        # Check exact match first
+        if (!driver %in% available_drivers$name) {
+          # Try case-insensitive match
+          driver_lower <- tolower(driver)
+          available_lower <- tolower(available_drivers$name)
+          matched_idx <- which(available_lower == driver_lower)
+          
+          if (length(matched_idx) > 0) {
+            # Found case-insensitive match, use the actual name from the list
+            driver <- available_drivers$name[matched_idx[1]]
+            message(sprintf("Note: Using driver name '%s' (case-adjusted from secrets.R)", driver))
+          } else {
+            # No match found, but don't fail - let the connection attempt handle it
+            warning(sprintf("Driver '%s' from secrets.R not found in available drivers list.", driver))
+            message("Available drivers:")
+            print(available_drivers)
+            message("Will attempt connection anyway - driver name may still work.")
+          }
+        }
+      }, error = function(e) {
+        # If we can't check, proceed anyway
+        message("Could not validate driver name: ", e$message)
+      })
+    }
+    return(driver)
+  }
+  
+  # If not in secrets, try to find an Oracle driver automatically
+  if (requireNamespace("odbc", quietly = TRUE)) {
+    tryCatch({
+      available_drivers <- odbc::odbcListDrivers()
+      oracle_drivers <- available_drivers[grepl("Oracle", available_drivers$name, ignore.case = TRUE), ]
+      if (nrow(oracle_drivers) > 0) {
+        # Return the first Oracle driver found
+        return(oracle_drivers$name[1])
+      }
+    }, error = function(e) {
+      # Silently fail and return NULL
+    })
+  }
+  
+  # If no driver found, return NULL (will try connection without explicit driver)
+  return(NULL)
+}
+
 #' Fetch data from Oracle database to be stored in a data frame
 #'
 #' Retrieves data from an Oracle table or view and optionally joins it with a primary keys table
@@ -91,10 +184,21 @@ oracle <- function(table_name = NULL, ..., fields = NULL, where_clause = NULL,
     stop("No table name or custom query provided. Use oracle.index() to see available tables.")
   }
 
-  # Get connection parameters using get_secret
-  dsn <- get_secret("host")  # This should be the DSN name
+  # Set Oracle environment variables from secrets if they exist
+  tns_admin <- get_secret_optional("TNS_ADMIN")
+  oracle_home <- get_secret_optional("ORACLE_HOME")
+  if (!is.null(tns_admin) && nchar(tns_admin) > 0) {
+    Sys.setenv(TNS_ADMIN = tns_admin)
+  }
+  if (!is.null(oracle_home) && nchar(oracle_home) > 0) {
+    Sys.setenv(ORACLE_HOME = oracle_home)
+  }
+
+  # Get connection parameters (supports both DSN and DBQ for TNS aliases)
+  conn_params <- get_oracle_connection_params()
   user_id <- get_secret("uid")
   password <- get_secret("pwd")
+  driver <- get_oracle_driver()
 
   # Display loading message
   if (!is.null(custom_query)) {
@@ -117,10 +221,24 @@ oracle <- function(table_name = NULL, ..., fields = NULL, where_clause = NULL,
   result_data <- NULL
 
   tryCatch({
-    channel <- odbc::dbConnect(odbc::odbc(),
-                              dsn = dsn,
-                              UID = user_id,
-                              PWD = password)
+    # Build connection parameters with Driver as first parameter if available
+    # Use DBQ for TNS aliases, dsn for ODBC DSNs
+    conn_args <- list(
+      UID = user_id,
+      PWD = password
+    )
+    
+    if (!is.null(driver)) {
+      conn_args$Driver <- driver
+    }
+    
+    if (conn_params$use_dbq) {
+      conn_args$DBQ <- conn_params$value
+    } else {
+      conn_args$dsn <- conn_params$value
+    }
+    
+    channel <- do.call(odbc::dbConnect, c(list(odbc::odbc()), conn_args))
     if (is.null(channel)) {
       stop("Failed to connect to database. Please check your connection settings.")
     }
@@ -375,20 +493,45 @@ oracle.index <- function(schema = NULL) {
   validate_secrets("sql")
   config <- validate_config("sql")
 
-  # Get connection parameters using get_secret
-  dsn <- get_secret("host")  # This should be the DSN name
+  # Set Oracle environment variables from secrets if they exist
+  tns_admin <- get_secret_optional("TNS_ADMIN")
+  oracle_home <- get_secret_optional("ORACLE_HOME")
+  if (!is.null(tns_admin) && nchar(tns_admin) > 0) {
+    Sys.setenv(TNS_ADMIN = tns_admin)
+  }
+  if (!is.null(oracle_home) && nchar(oracle_home) > 0) {
+    Sys.setenv(ORACLE_HOME = oracle_home)
+  }
+
+  # Get connection parameters (supports both DSN and DBQ for TNS aliases)
+  conn_params <- get_oracle_connection_params()
   user_id <- get_secret("uid")
   password <- get_secret("pwd")
+  driver <- get_oracle_driver()
 
   # Connect to database
   channel <- NULL
   tables <- NULL
 
   tryCatch({
-    channel <- odbc::dbConnect(odbc::odbc(),
-                              dsn = dsn,
-                              UID = user_id,
-                              PWD = password)
+    # Build connection parameters with Driver as first parameter if available
+    # Use DBQ for TNS aliases, dsn for ODBC DSNs
+    conn_args <- list(
+      UID = user_id,
+      PWD = password
+    )
+    
+    if (!is.null(driver)) {
+      conn_args$Driver <- driver
+    }
+    
+    if (conn_params$use_dbq) {
+      conn_args$DBQ <- conn_params$value
+    } else {
+      conn_args$dsn <- conn_params$value
+    }
+    
+    channel <- do.call(odbc::dbConnect, c(list(odbc::odbc()), conn_args))
     if (is.null(channel)) {
       stop("Failed to connect to database")
     }
@@ -517,6 +660,16 @@ oracle.desc <- function(table_name, schema = NULL) {
   validate_secrets("sql")
   config <- validate_config("sql")
 
+  # Set Oracle environment variables from secrets if they exist
+  tns_admin <- get_secret_optional("TNS_ADMIN")
+  oracle_home <- get_secret_optional("ORACLE_HOME")
+  if (!is.null(tns_admin) && nchar(tns_admin) > 0) {
+    Sys.setenv(TNS_ADMIN = tns_admin)
+  }
+  if (!is.null(oracle_home) && nchar(oracle_home) > 0) {
+    Sys.setenv(ORACLE_HOME = oracle_home)
+  }
+
   # Parse table_name to extract schema if not provided separately
   if (is.null(schema) && grepl("\\.", table_name)) {
     parts <- strsplit(table_name, "\\.")[[1]]
@@ -527,20 +680,35 @@ oracle.desc <- function(table_name, schema = NULL) {
     }
   }
 
-  # Get connection parameters using get_secret
-  dsn <- get_secret("host")  # This should be the DSN name
+  # Get connection parameters (supports both DSN and DBQ for TNS aliases)
+  conn_params <- get_oracle_connection_params()
   user_id <- get_secret("uid")
   password <- get_secret("pwd")
+  driver <- get_oracle_driver()
 
   # Connect to database
   channel <- NULL
   columns <- NULL
 
   tryCatch({
-    channel <- odbc::dbConnect(odbc::odbc(),
-                              dsn = dsn,
-                              UID = user_id,
-                              PWD = password)
+    # Build connection parameters with Driver as first parameter if available
+    # Use DBQ for TNS aliases, dsn for ODBC DSNs
+    conn_args <- list(
+      UID = user_id,
+      PWD = password
+    )
+    
+    if (!is.null(driver)) {
+      conn_args$Driver <- driver
+    }
+    
+    if (conn_params$use_dbq) {
+      conn_args$DBQ <- conn_params$value
+    } else {
+      conn_args$dsn <- conn_params$value
+    }
+    
+    channel <- do.call(odbc::dbConnect, c(list(odbc::odbc()), conn_args))
     if (is.null(channel)) {
       stop("Failed to connect to database")
     }
@@ -557,37 +725,42 @@ oracle.desc <- function(table_name, schema = NULL) {
     is_oracle <- TRUE  # Always TRUE for oracle.desc
 
     # Try to get column information
-    tryCatch({
-      if (!is.null(schema)) {
-        # With schema
-        columns <- odbc::dbListFields(channel, name = table_name, schema_name = schema)
-      } else {
-        # Without schema
-        columns <- odbc::dbListFields(channel, name = table_name)
-      }
-      
-      # Convert to data frame format
-      if (!is.null(columns) && length(columns) > 0) {
-        columns_df <- data.frame(
-          Column = columns,
-          Type = rep("Unknown", length(columns)),
-          Size = rep(NA, length(columns)),
-          Nullable = rep("Unknown", length(columns)),
-          stringsAsFactors = FALSE
-        )
-        columns <- columns_df
-      }
-    }, error = function(e) {
-      message(paste("Error using dbListFields:", e$message))
-      # For Oracle, fall back to direct query
-      if (is_oracle) {
-        message("Trying direct Oracle query for column information...")
-        # Try with uppercase table name for Oracle
-        upper_table <- toupper(table_name)
-        oracle_query <- if (!is.null(schema)) {
-          # With schema
+    # Oracle stores table names in uppercase, so try both original and uppercase
+    columns <- NULL
+    upper_table <- toupper(table_name)
+    
+    # First, try direct Oracle query (more reliable than dbListFields for Oracle)
+    if (is_oracle) {
+      tryCatch({
+        # Try user_tab_columns first (current user's schema) if no schema specified
+        if (is.null(schema)) {
+          # Try current user's schema first
+          oracle_query <- sprintf(
+            "SELECT column_name, data_type, data_length,
+             DECODE(nullable, 'Y', 'Yes', 'No') as nullable
+             FROM user_tab_columns
+             WHERE table_name = '%s'
+             ORDER BY column_id",
+            upper_table
+          )
+          columns <- odbc::dbGetQuery(channel, oracle_query)
+          
+          # If no results, try all_tab_columns (all accessible schemas)
+          if (is.null(columns) || !is.data.frame(columns) || nrow(columns) == 0) {
+            oracle_query <- sprintf(
+              "SELECT owner as schema_name, column_name, data_type, data_length,
+               DECODE(nullable, 'Y', 'Yes', 'No') as nullable
+               FROM all_tab_columns
+               WHERE table_name = '%s'
+               ORDER BY owner, column_id",
+              upper_table
+            )
+            columns <- odbc::dbGetQuery(channel, oracle_query)
+          }
+        } else {
+          # With schema specified
           upper_schema <- toupper(schema)
-          sprintf(
+          oracle_query <- sprintf(
             "SELECT column_name, data_type, data_length,
              DECODE(nullable, 'Y', 'Yes', 'No') as nullable
              FROM all_tab_columns
@@ -595,32 +768,64 @@ oracle.desc <- function(table_name, schema = NULL) {
              ORDER BY column_id",
             upper_schema, upper_table
           )
-        } else {
-          # Without schema, look in all accessible schemas
-          sprintf(
-            "SELECT owner as schema_name, column_name, data_type, data_length,
-             DECODE(nullable, 'Y', 'Yes', 'No') as nullable
-             FROM all_tab_columns
-             WHERE table_name = '%s'
-             ORDER BY owner, column_id",
-            upper_table
-          )
+          columns <- odbc::dbGetQuery(channel, oracle_query)
         }
-        columns <- odbc::dbGetQuery(channel, oracle_query)
-        if (is.character(columns) && length(columns) == 1) {
-          # Error message
-          message(paste("Oracle query error:", columns))
-          columns <- NULL
-        } else if (!is.null(columns) && nrow(columns) > 0) {
+        
+        # Process the results
+        if (!is.null(columns) && is.data.frame(columns) && nrow(columns) > 0) {
           # Rename columns to match expected format
-          if ("schema_name" %in% names(columns)) {
+          if ("OWNER" %in% names(columns) || "schema_name" %in% names(columns)) {
+            # Has schema column
+            schema_col <- if ("OWNER" %in% names(columns)) "OWNER" else "schema_name"
+            col_order <- c(schema_col, "COLUMN_NAME", "DATA_TYPE", "DATA_LENGTH", "nullable")
+            col_order <- col_order[col_order %in% names(columns)]
+            columns <- columns[, col_order, drop = FALSE]
             names(columns) <- c("Schema", "Column", "Type", "Size", "Nullable")
           } else {
+            # No schema column
+            col_order <- c("COLUMN_NAME", "DATA_TYPE", "DATA_LENGTH", "nullable")
+            col_order <- col_order[col_order %in% names(columns)]
+            columns <- columns[, col_order, drop = FALSE]
             names(columns) <- c("Column", "Type", "Size", "Nullable")
           }
+        } else {
+          columns <- NULL
         }
-      }
-    })
+      }, error = function(e) {
+        message(paste("Error querying Oracle data dictionary:", e$message))
+        columns <- NULL
+      })
+    }
+    
+    # Fallback to dbListFields if Oracle query didn't work
+    if (is.null(columns) || !is.data.frame(columns) || nrow(columns) == 0) {
+      tryCatch({
+        # Try with uppercase table name for Oracle
+        table_to_use <- if (is_oracle) upper_table else table_name
+        if (!is.null(schema)) {
+          columns <- odbc::dbListFields(channel, name = table_to_use, schema_name = schema)
+        } else {
+          columns <- odbc::dbListFields(channel, name = table_to_use)
+        }
+        
+        # Convert to data frame format
+        if (!is.null(columns) && length(columns) > 0) {
+          columns_df <- data.frame(
+            Column = columns,
+            Type = rep("Unknown", length(columns)),
+            Size = rep(NA, length(columns)),
+            Nullable = rep("Unknown", length(columns)),
+            stringsAsFactors = FALSE
+          )
+          columns <- columns_df
+        }
+      }, error = function(e) {
+        # dbListFields failed, but we already tried Oracle query, so just note it
+        if (is.null(columns)) {
+          message(paste("Error using dbListFields:", e$message))
+        }
+      })
+    }
 
   }, error = function(e) {
     message(paste("Error retrieving columns for table", table_name, ":", e$message))
@@ -636,7 +841,7 @@ oracle.desc <- function(table_name, schema = NULL) {
   })
 
   # Format the result
-  if (!is.null(columns) && nrow(columns) > 0) {
+  if (!is.null(columns) && is.data.frame(columns) && nrow(columns) > 0 && !is.na(nrow(columns))) {
     # Keep only relevant columns
     if (all(c("COLUMN_NAME", "TYPE_NAME", "COLUMN_SIZE", "NULLABLE") %in% names(columns))) {
       columns <- columns[, c("COLUMN_NAME", "TYPE_NAME", "COLUMN_SIZE", "NULLABLE")]
@@ -674,10 +879,21 @@ oracle.query <- function(query, pii = FALSE, schema = NULL) {
   validate_secrets("sql")
   config <- validate_config("sql")
 
-  # Get connection parameters using get_secret
-  dsn <- get_secret("host")  # This should be the DSN name
+  # Set Oracle environment variables from secrets if they exist
+  tns_admin <- get_secret_optional("TNS_ADMIN")
+  oracle_home <- get_secret_optional("ORACLE_HOME")
+  if (!is.null(tns_admin) && nchar(tns_admin) > 0) {
+    Sys.setenv(TNS_ADMIN = tns_admin)
+  }
+  if (!is.null(oracle_home) && nchar(oracle_home) > 0) {
+    Sys.setenv(ORACLE_HOME = oracle_home)
+  }
+
+  # Get connection parameters (supports both DSN and DBQ for TNS aliases)
+  conn_params <- get_oracle_connection_params()
   user_id <- get_secret("uid")
   password <- get_secret("pwd")
+  driver <- get_oracle_driver()
 
   # Get PII fields configuration if needed with proper validation
   pii_fields <- NULL
@@ -707,10 +923,47 @@ oracle.query <- function(query, pii = FALSE, schema = NULL) {
   result <- NULL
 
   tryCatch({
-    channel <- odbc::dbConnect(odbc::odbc(),
-                              dsn = dsn,
-                              UID = user_id,
-                              PWD = password)
+    # Build connection parameters with Driver as first parameter if available
+    # Use DBQ for TNS aliases, dsn for ODBC DSNs
+    conn_args <- list(
+      UID = user_id,
+      PWD = password
+    )
+    
+    if (!is.null(driver)) {
+      conn_args$Driver <- driver
+    }
+    
+    if (conn_params$use_dbq) {
+      conn_args$DBQ <- conn_params$value
+    } else {
+      conn_args$dsn <- conn_params$value
+    }
+    
+    # Attempt connection with better error handling for IM006
+    tryCatch({
+      channel <- do.call(odbc::dbConnect, c(list(odbc::odbc()), conn_args))
+    }, error = function(e) {
+      error_msg <- e$message
+      if (grepl("IM006", error_msg, ignore.case = TRUE)) {
+        message("\nTroubleshooting IM006 error (Driver's SQLSetConnectAttr failed):")
+        if (conn_params$use_dbq) {
+          message("1. Verify TNS_ADMIN is set correctly and points to directory containing tnsnames.ora")
+          message(sprintf("2. Verify DBQ '%s' exists in tnsnames.ora file", conn_params$value))
+          message("3. Check that ORACLE_HOME is set correctly")
+          message("4. Verify the TNS alias name matches exactly (case-sensitive)")
+        } else {
+          message("1. Verify DSN is correctly configured in ODBC Data Source Administrator")
+          message("2. Check for 32-bit vs 64-bit driver mismatch")
+          message("3. Try recreating the DSN")
+        }
+        message("5. Ensure Oracle client is properly installed and configured")
+        stop("Connection failed with IM006 error. See troubleshooting steps above.")
+      } else {
+        stop(error_msg)
+      }
+    })
+    
     if (is.null(channel)) {
       stop("Failed to connect to database")
     }
@@ -1323,13 +1576,32 @@ oracle.test <- function() {
     return(FALSE)
   })
   
-  # Get connection parameters using get_secret
-  dsn <- get_secret("host")  # This should be the DSN name
+  # Set Oracle environment variables from secrets if they exist
+  tns_admin <- get_secret_optional("TNS_ADMIN")
+  oracle_home <- get_secret_optional("ORACLE_HOME")
+  if (!is.null(tns_admin) && nchar(tns_admin) > 0) {
+    Sys.setenv(TNS_ADMIN = tns_admin)
+    message(sprintf("Set TNS_ADMIN = %s", tns_admin))
+  }
+  if (!is.null(oracle_home) && nchar(oracle_home) > 0) {
+    Sys.setenv(ORACLE_HOME = oracle_home)
+    message(sprintf("Set ORACLE_HOME = %s", oracle_home))
+  }
+  
+  # Get connection parameters (supports both DSN and DBQ for TNS aliases)
+  tryCatch({
+    conn_params <- get_oracle_connection_params()
+  }, error = function(e) {
+    message("Error getting connection parameters: ", e$message)
+    return(FALSE)
+  })
+  
   user_id <- get_secret("uid")
   password <- get_secret("pwd")
+  driver <- get_oracle_driver(validate = TRUE)  # Validate driver name if specified
   
   # Validate that we have the required connection parameters
-  if (is.null(dsn) || is.null(user_id) || is.null(password)) {
+  if (is.null(conn_params$value) || is.null(user_id) || is.null(password)) {
     message("Missing connection parameters. Please check your secrets configuration.")
     return(FALSE)
   }
@@ -1339,13 +1611,97 @@ oracle.test <- function() {
   connection_successful <- FALSE
   
   tryCatch({
-    message(sprintf("Testing connection to DSN: %s", dsn))
+    if (conn_params$use_dbq) {
+      message(sprintf("Testing connection to TNS alias (DBQ): %s", conn_params$value))
+    } else {
+      message(sprintf("Testing connection to DSN: %s", conn_params$value))
+    }
+    if (!is.null(driver)) {
+      message(sprintf("Using driver: %s", driver))
+    } else {
+      message("No driver specified - attempting connection without explicit driver")
+    }
     
-    # Attempt to connect
-    channel <- odbc::dbConnect(odbc::odbc(),
-                              dsn = dsn,
-                              UID = user_id,
-                              PWD = password)
+    # Check connection target length (IM010 can be caused by name being too long)
+    if (!conn_params$use_dbq && nchar(conn_params$value) > 32) {
+      message(sprintf("Warning: DSN name is %d characters long. Some ODBC drivers have a 32-character limit.", nchar(conn_params$value)))
+    }
+    
+    # List available DSNs for diagnostics
+    tryCatch({
+      available_dsns <- odbc::odbcListDataSources()
+        if (nrow(available_dsns) > 0) {
+          message("Available DSNs:")
+          print(available_dsns)
+          if (!conn_params$use_dbq && !conn_params$value %in% available_dsns$name) {
+            message(sprintf("Warning: DSN '%s' not found in list of available DSNs.", conn_params$value))
+            message("This may indicate a configuration issue or 32-bit/64-bit driver mismatch.")
+            message("If you're using a TNS alias, make sure to set 'DBQ' in secrets.R instead of 'dsn' or 'host'.")
+          }
+        }
+    }, error = function(e) {
+      message("Could not list available DSNs: ", e$message)
+    })
+    
+    # List available drivers for diagnostics
+    tryCatch({
+      available_drivers <- odbc::odbcListDrivers()
+      if (nrow(available_drivers) > 0) {
+        message("All available ODBC drivers:")
+        print(available_drivers)
+        oracle_drivers <- available_drivers[grepl("Oracle", available_drivers$name, ignore.case = TRUE), ]
+        if (nrow(oracle_drivers) > 0) {
+          message("\nAvailable Oracle drivers:")
+          print(oracle_drivers)
+          # Don't fail here - let the actual connection attempt determine if driver works
+          # The driver validation already happened in get_oracle_driver()
+          if (!is.null(driver)) {
+            # Check if driver matches (case-insensitive)
+            driver_lower <- tolower(trimws(driver))
+            available_lower <- tolower(available_drivers$name)
+            if (!driver_lower %in% available_lower) {
+              message(sprintf("\nWarning: Driver '%s' from secrets.R not found in available drivers list.", driver))
+              message("Will attempt connection anyway - the driver name may still work.")
+            } else {
+              message(sprintf("\nDriver '%s' found in available drivers.", driver))
+            }
+          }
+        } else {
+          message("Warning: No Oracle drivers found. You may need to install an Oracle ODBC driver.")
+        }
+      }
+    }, error = function(e) {
+      message("Could not list available drivers: ", e$message)
+    })
+    
+    # Attempt to connect with Driver as first parameter if available
+    # Use DBQ for TNS aliases, dsn for ODBC DSNs
+    conn_args <- list(
+      UID = user_id,
+      PWD = password
+    )
+    
+    if (!is.null(driver)) {
+      conn_args$Driver <- driver
+    }
+    
+    if (conn_params$use_dbq) {
+      conn_args$DBQ <- conn_params$value
+      if (!is.null(driver)) {
+        message(sprintf("\nAttempting connection with Driver='%s', DBQ='%s' (TNS alias)", driver, conn_params$value))
+      } else {
+        message(sprintf("\nAttempting connection with DBQ='%s' (TNS alias, no explicit driver)", conn_params$value))
+      }
+    } else {
+      conn_args$dsn <- conn_params$value
+      if (!is.null(driver)) {
+        message(sprintf("\nAttempting connection with Driver='%s', DSN='%s'", driver, conn_params$value))
+      } else {
+        message(sprintf("\nAttempting connection with DSN='%s' (no explicit driver)", conn_params$value))
+      }
+    }
+    
+    channel <- do.call(odbc::dbConnect, c(list(odbc::odbc()), conn_args))
     
     if (is.null(channel)) {
       message("Connection failed: channel is null")
@@ -1364,7 +1720,37 @@ oracle.test <- function() {
     connection_successful <- TRUE
     
   }, error = function(e) {
-    message("Connection failed: ", e$message)
+    error_msg <- e$message
+    message("Connection failed: ", error_msg)
+    
+    # Provide specific guidance for IM010 error
+    if (grepl("IM010", error_msg, ignore.case = TRUE)) {
+      message("\nTroubleshooting IM010 error:")
+      message("1. Verify the DSN name is correct and exists in ODBC Data Source Administrator")
+      message("2. Check for 32-bit vs 64-bit driver mismatch (R may be 64-bit but DSN uses 32-bit driver)")
+      message("3. Ensure Oracle ODBC driver is properly installed")
+      message("4. Try recreating the DSN in ODBC Data Source Administrator")
+      message("5. If DSN name is longer than 32 characters, try using a shorter name")
+      message("6. Consider using a driver name instead of DSN (may require config changes)")
+    }
+    
+    # Provide specific guidance for IM002 error (driver not found)
+    if (grepl("IM002", error_msg, ignore.case = TRUE)) {
+      message("\nTroubleshooting IM002 error (Driver not found):")
+      message("1. The driver name specified does not match any installed ODBC driver")
+      if (!is.null(driver)) {
+        message(sprintf("2. Driver specified: '%s'", driver))
+      }
+      message("3. Check the list of available drivers printed above")
+      message("4. Update your secrets.R file with the exact driver name from the list")
+      message("5. Driver names are case-sensitive and must match exactly")
+      message("6. Common Oracle driver names include:")
+      message("   - 'Oracle in instantclient_19_3'")
+      message("   - 'Oracle in instantclient_21_1'")
+      message("   - 'Oracle 19 ODBC driver'")
+      message("   - 'Oracle in instantclient_23_1'")
+    }
+    
     connection_successful <- FALSE
   }, finally = {
     # Always try to close the connection

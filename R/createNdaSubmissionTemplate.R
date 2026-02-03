@@ -12,6 +12,11 @@
 #'        and template file should be created. Defaults to the current working directory.
 #' @param skip_prompt Logical. If TRUE (default), skips the confirmation prompt. If FALSE,
 #'        will prompt for confirmation unless the user has previously chosen to remember their preference.
+#' @param selected_fields Character vector of field names to include in template. If NULL (default),
+#'        uses all fields from data frame. Used by create_nda_files() for centralized field selection.
+#' @param skip_prompts Logical. If TRUE, skip ALL interactive prompts (used when called from
+#'        create_nda_files() with pre-selected fields). Default: FALSE.
+#' @param verbose Logical. If TRUE, show detailed progress messages. Default: FALSE.
 #'
 #' @return Invisible TRUE if successful. Creates a CSV file at the specified path
 #'         and prints a message with the file location.
@@ -19,7 +24,7 @@
 #' @details
 #' The function will:
 #' 1. Create a 'tmp' directory if it doesn't exist
-#' 2. Parse the structure name into base and suffix components (e.g., "eefrt01" → "eefrt" and "01")
+#' 2. Parse the structure name into base and suffix components (e.g., "eefrt01" -> "eefrt" and "01")
 #' 3. Write the structure name components as the first line
 #' 4. Write column headers as the second line
 #' 5. Write the data rows below
@@ -45,7 +50,7 @@
 #' }
 #'
 #' @export
-to.nda <- function(df, path = ".", skip_prompt = TRUE) { #set skip_prompt to TRUE so users need to specify to see prompt after prefs are set
+to.nda <- function(df, path = ".", skip_prompt = TRUE, selected_fields = NULL, skip_prompts = FALSE, verbose = FALSE) { #set skip_prompt to TRUE so users need to specify to see prompt after prefs are set
   # Check for user preferences file
   user_prefs_file <- file.path(path, ".wizaRdry_prefs")
   user_prefs <- list(shown_tree = FALSE, auto_create = FALSE, auto_clean = FALSE, auto_nda = FALSE, auto_nda_template = FALSE)
@@ -104,7 +109,7 @@ to.nda <- function(df, path = ".", skip_prompt = TRUE) { #set skip_prompt to TRU
   structure_name <- df_name
 
   # Create the file path
-  file_path <- file.path(tmp_path, paste0(structure_name, '_template.csv'))
+  file_path <- file.path(tmp_path, paste0(structure_name, '_submission.csv'))
 
   # Get the data frame
   if (is.character(df)) {
@@ -113,13 +118,165 @@ to.nda <- function(df, path = ".", skip_prompt = TRUE) { #set skip_prompt to TRU
     template <- df
   }
 
+  # Drop old pre-transformed fields (ending with .1, .2, etc.) that correspond to renamed fields
+  # These are old versions of fields that were renamed during validation
+  template_cols <- names(template)
+  old_transformed_fields <- template_cols[grepl("\\.\\d+$", template_cols)]
+  
+  if (length(old_transformed_fields) > 0) {
+    fields_to_drop <- character(0)
+    for (old_field in old_transformed_fields) {
+      # Extract base name by removing .1, .2, etc. suffix
+      base_name <- sub("\\.\\d+$", "", old_field)
+      # Check if the base name (without suffix) exists in the template
+      if (base_name %in% template_cols) {
+        # This is an old version of a renamed field - drop it
+        fields_to_drop <- c(fields_to_drop, old_field)
+      }
+    }
+    
+    if (length(fields_to_drop) > 0) {
+      template <- template[, !names(template) %in% fields_to_drop, drop = FALSE]
+      message(sprintf("Dropped %d old pre-transformed field(s): %s", 
+                     length(fields_to_drop), paste(fields_to_drop, collapse = ", ")))
+      template_cols <- names(template)  # Update after dropping
+    }
+  }
+
   # Define fields to exclude from submission templates
   excluded_from_template <- c("state", "lost_to_followup", "lost_to_follow-up")
+  
+  # Super-required fields (always included): subjectkey, src_subject_id, interview_date, interview_age, sex
+  super_required_fields <- SUPER_REQUIRED_FIELDS
+  
+  # Get structure field names to check which required fields exist in this structure
+  structure_field_names <- character(0)
+  ndar_required_in_structure <- character(0)
+  
+  # Try to fetch the structure to see which fields it contains
+  tryCatch({
+    nda_base_url <- "https://nda.nih.gov/api/datadictionary/v2"
+    structure_url <- sprintf("%s/datastructure/%s", nda_base_url, structure_name)
+    structure_response <- httr::GET(structure_url, httr::timeout(10))
+    if (httr::status_code(structure_response) == 200) {
+      raw_content <- rawToChar(structure_response$content)
+      if (nchar(raw_content) > 0) {
+        structure_data <- jsonlite::fromJSON(raw_content)
+        if ("dataElements" %in% names(structure_data)) {
+          structure_field_names <- structure_data$dataElements$name
+        }
+      }
+    }
+  }, error = function(e) {
+    # Silently fail if structure fetch fails
+  })
+  
+  # Get required fields from ndar_subject01 that exist in the current structure
+  if (length(structure_field_names) > 0) {
+    tryCatch({
+      nda_base_url <- "https://nda.nih.gov/api/datadictionary/v2"
+      url <- sprintf("%s/datastructure/ndar_subject01", nda_base_url)
+      
+      response <- httr::GET(url, httr::timeout(10))
+      if (httr::status_code(response) == 200) {
+        raw_content <- rawToChar(response$content)
+        if (nchar(raw_content) > 0) {
+          subject_structure <- jsonlite::fromJSON(raw_content)
+          if ("dataElements" %in% names(subject_structure)) {
+            ndar_required <- subject_structure$dataElements[subject_structure$dataElements$required == "Required", ]
+            if (nrow(ndar_required) > 0) {
+              ndar_required_names <- ndar_required$name
+              # Get required fields that exist in structure but are not super-required
+              ndar_required_in_structure <- setdiff(
+                intersect(ndar_required_names, structure_field_names),
+                super_required_fields
+              )
+            }
+          }
+        }
+      }
+    }, error = function(e) {
+      # Silently fail if API call fails
+    })
+  }
+  
+  # Automatically include super-required fields if they exist in structure but not in template
+  missing_super_required <- setdiff(
+    intersect(super_required_fields, structure_field_names),
+    template_cols
+  )
+  
+  if (length(missing_super_required) > 0) {
+    # Add missing super-required fields with NA values
+    for (field in missing_super_required) {
+      template[[field]] <- NA
+    }
+    message(sprintf("\nAutomatically including super-required fields: %s", 
+                   paste(missing_super_required, collapse = ", ")))
+    template_cols <- names(template)  # Update after adding fields
+  }
+  
+  # Note: DCC required fields and timepoint fields removed - users should include them in their NDA script if needed
+  
+  # Use selected_fields if provided (from centralized field selection)
+  # Otherwise, prompt user in interactive mode
+  if (!is.null(selected_fields) && skip_prompts) {
+    # Use pre-selected fields from create_nda_files()
+    # STEP 1: Add any missing fields from selected_fields to template
+    fields_to_add <- setdiff(selected_fields, template_cols)
+    if (length(fields_to_add) > 0) {
+      for (field in fields_to_add) {
+        # Add field with NA values
+        # Note: structure_field_names check removed because we trust selected_fields
+        # which includes super required fields that may not be in structure yet
+        template[[field]] <- NA
+      }
+    }
+    
+    # STEP 2: Filter template to ONLY include selected_fields (in the order specified)
+    # This removes any fields that were excluded (e.g., DCC fields when dcc=FALSE)
+    template <- template[, intersect(selected_fields, names(template)), drop = FALSE]
+    template_cols <- names(template)
+  } else if (interactive() && length(ndar_required_in_structure) > 0 && !skip_prompts) {
+    # Original interactive prompt logic (only when NOT using pre-selected fields)
+    missing_required_in_structure <- setdiff(ndar_required_in_structure, template_cols)
+    
+    if (length(missing_required_in_structure) > 0) {
+      message("\nThe following NDA required fields exist in this structure but are not in the template:")
+      message(paste("  ", paste(missing_required_in_structure, collapse = ", ")))
+      
+      user_input <- readline(
+        prompt = sprintf("Would you like to include these %d required field(s)? (y/n): ", 
+                         length(missing_required_in_structure))
+      )
+      
+      # Validate input
+      while (!tolower(user_input) %in% c("y", "n", "yes", "no")) {
+        user_input <- readline(
+          prompt = "Please enter 'y' for yes or 'n' for no: "
+        )
+      }
+      
+      if (tolower(user_input) %in% c("y", "yes")) {
+        # Add missing required fields with NA values
+        for (field in missing_required_in_structure) {
+          template[[field]] <- NA
+        }
+        message(sprintf("Added %d required field(s) to template.", 
+                       length(missing_required_in_structure)))
+        template_cols <- names(template)  # Update after adding fields
+      } else {
+        message("Skipping required fields. Note: These fields may be needed for NDA submission.")
+      }
+    }
+  }
   
   # Get essential NDA fields dynamically from ndar_subject01 API
   # This ensures we always have the current required elements
   essential_nda_fields <- tryCatch({
-    message("Fetching current ndar_subject01 required elements from NDA API...")
+    if (verbose) {
+      message("Fetching current ndar_subject01 required elements from NDA API...")
+    }
     nda_base_url <- "https://nda.nih.gov/api/datadictionary/v2"
     url <- sprintf("%s/datastructure/ndar_subject01", nda_base_url)
     
@@ -132,7 +289,9 @@ to.nda <- function(df, path = ".", skip_prompt = TRUE) { #set skip_prompt to TRU
           required_metadata <- subject_structure$dataElements[subject_structure$dataElements$required == "Required", ]
           if (nrow(required_metadata) > 0) {
             field_names <- required_metadata$name
-            message(sprintf("Found %d required ndar_subject01 elements for template", length(field_names)))
+            if (verbose) {
+              message(sprintf("Found %d required ndar_subject01 elements for template", length(field_names)))
+            }
             field_names
           } else {
             stop("No required elements found")
@@ -154,25 +313,18 @@ to.nda <- function(df, path = ".", skip_prompt = TRUE) { #set skip_prompt to TRU
   })
   
   # Filter template columns:
-  # 1. Remove excluded fields
-  # 2. Include essential NDA fields + other non-excluded fields
-  template_cols <- names(template)
+  # Just remove explicitly excluded fields
+  # The dataframe has already been cleaned up by the nda script and DCC removal logic,
+  # so we trust that all remaining fields should be in the template
   excluded_cols <- template_cols[template_cols %in% excluded_from_template]
-  essential_cols <- template_cols[template_cols %in% essential_nda_fields]
-  other_cols <- template_cols[!template_cols %in% c(excluded_from_template, essential_nda_fields)]
+  filtered_cols <- template_cols[!template_cols %in% excluded_from_template]
   
-  # Create filtered template with essential fields first, then others
-  filtered_cols <- c(essential_cols, other_cols)
   template <- template[, filtered_cols, drop = FALSE]
   
   # Report what was filtered
   if (length(excluded_cols) > 0) {
     message(sprintf("Excluded %d fields from submission template: %s", 
                     length(excluded_cols), paste(excluded_cols, collapse = ", ")))
-  }
-  if (length(essential_cols) > 0) {
-    message(sprintf("Included %d essential NDA fields: %s", 
-                    length(essential_cols), paste(essential_cols, collapse = ", ")))
   }
 
   # Open a connection to overwrite the file
@@ -189,10 +341,20 @@ to.nda <- function(df, path = ".", skip_prompt = TRUE) { #set skip_prompt to TRU
     structure_suffix <- "01"
   }
 
+  # Remove columns with NA names BEFORE writing anything (prevents parser warnings)
+  valid_cols <- !is.na(names(template))
+  if (!all(valid_cols)) {
+    invalid_count <- sum(!valid_cols)
+    if (invalid_count > 0) {
+      message(sprintf("Note: Removing %d column(s) with invalid (NA) names", invalid_count))
+    }
+    template <- template[, valid_cols, drop = FALSE]
+  }
+
   # Write the line with separated components
   writeLines(paste0(structure_short_name, ",", structure_suffix), con)
 
-  # Write column headers manually
+  # Write column headers manually (now with NA columns already removed)
   writeLines(paste(names(template), collapse = ","), con)
 
   # Close the connection to save changes
@@ -202,8 +364,7 @@ to.nda <- function(df, path = ".", skip_prompt = TRUE) { #set skip_prompt to TRU
   write.table(template, file_path, row.names = FALSE, col.names = FALSE, append = TRUE,
               quote = TRUE, sep = ",", na = "")
 
-  message(sprintf("\nSubmission Template created at: %s \n", file_path))
-
+  # Message removed - caller (ndaFileCreation.R) handles user messaging
   return(invisible(TRUE))
 }
 
