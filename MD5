@@ -1,11 +1,11 @@
-200f6092b3b4a4b2d3fecdbc688b4707 *DESCRIPTION
+d33cdefcd5ffd29369a0e4548e0e4bcb *DESCRIPTION
 b4e6a4f17c35fb17e9a3c8c9600e8c84 *LICENSE
 48c4559b717d7e170190ad90f25d5f11 *NAMESPACE
 1d1b488527c3eb0b7db068d44ecc9156 *NEWS.md
 7409b233b386d6cbc9893094189a8d2d *R/CategoricalVariables.R
 f516b51fc67c1b2a3541c6c8cf8eba1f *R/ConfigEnv.R
 fecb378e74ea1a1a12ea211794c29784 *R/DataEnvironment.R
-da613013361a5dd6e32f6e8ba0997a4e *R/NdaClasses.R
+1e2316fbb8cd02840c3f84c528a4a034 *R/NdaClasses.R
 29fe3528ca7c77eb9b4c33e5fcadfd5f *R/NdaDataStructure.R
 5e41624a9a170fe7a472a9ac6e708014 *R/SecretsEnv.R
 dd8c8e774658838ee17e9e1636fd7ede *R/StandardOutput.R
@@ -33,7 +33,7 @@ f98177f88dc05381e22e57a75e674426 *R/dataMerge.R
 1b4efe191f9b7c42f063e27912cebf90 *R/dataRequest.R
 df6cc46bc7fae1a55b713f3d5065b35a *R/dataWizardry-package.R
 8c4abd81d1f73203621c4232593c32a5 *R/deprecated.R
-edcd83e121e42c8050932fbd3da3d204 *R/getMongo.R
+9da5cbc443c67a058faaa863721eca32 *R/getMongo.R
 651721b70c8bf5c2719ad440bf42c662 *R/getOracle.R
 9faa53a998970b6ff9ff2a27f31548d5 *R/getQualtrics.R
 ca1883cdb4747a970fda3f4ea85f6808 *R/getRedcap.R
@@ -103,4 +103,4 @@ f33c613b31a419299fbf2b1d64524c51 *man/to.nda.Rd
 39f95fc37c77a51712e57e866940e413 *man/to.rds.Rd
 8e5998565f2ee6a3a73b537073189bfe *man/to.sav.Rd
 faa0601ffd6a46b269cef41e4f257ef9 *man/wizaRdry-deprecated.Rd
-722ac923cad710aee518b868230550df *man/wizaRdry-package.Rd
+15bdb9e9e53230aacec06820089eebf2 *man/wizaRdry-package.Rd

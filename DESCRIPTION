@@ -1,7 +1,7 @@
 Package: wizaRdry
 Title: A Magical Framework for Collaborative & Reproducible Data
         Analysis
-Version: 0.6.4
+Version: 0.6.5
 Authors@R: c(
     person("Joshua G.", "Kenney", email = "joshua.kenney@yale.edu", role = c("aut", "cre")),
     person("Trevor F.", "Williams", email = "trevormsu@gmail.com", role = "aut"),
@@ -13,7 +13,7 @@ Authors@R: c(
     person("Praveen", "Suthaharan", email = "praveen.suthaharan@yale.edu", role = "ctb"),
     person("Christian R.", "Horgan", email = "christian.horgan@yale.edu", role = "ctb")
   )
-Description: A comprehensive data analysis framework for NIH-funded research that streamlines workflows for both data cleaning and preparing NIH Data Archive ('NDA') submission templates. Provides unified access to multiple data sources ('REDCap', 'MongoDB', 'Qualtrics') through interfaces to their APIs, with specialized functions for data cleaning, filtering, merging, and parsing. Features automatic validation, field harmonization, and memory-aware processing to enhance reproducibility in multi-site collaborative research as described in Mittal et al. (2021) <doi:10.20900/jpbs.20210011>.
+Description: A comprehensive data analysis framework for NIH-funded research that streamlines workflows for both data cleaning and preparing NIH Data Archive ('NDA') submission templates. Provides unified access to multiple data sources ('REDCap', 'MongoDB', 'Qualtrics', 'SQL', 'ORACLE') through interfaces to their APIs, with specialized functions for data cleaning, filtering, merging, and parsing. Features automatic validation, field harmonization, and memory-aware processing to enhance reproducibility in multi-site collaborative research as described in Mittal et al. (2021) <doi:10.20900/jpbs.20210011>.
 License: MIT + file LICENSE
 Encoding: UTF-8
 RoxygenNote: 7.3.2
@@ -26,7 +26,7 @@ URL: https://github.com/belieflab/wizaRdry
 BugReports: https://github.com/belieflab/wizaRdry/issues
 Suggests: rmarkdown, yaml
 NeedsCompilation: no
-Packaged: 2026-02-03 22:41:33 UTC; Joshua
+Packaged: 2026-03-04 19:19:20 UTC; Joshua
 Author: Joshua G. Kenney [aut, cre],
   Trevor F. Williams [aut],
   Minerva K. Pappu [aut],
@@ -38,4 +38,4 @@ Author: Joshua G. Kenney [aut, cre],
   Christian R. Horgan [ctb]
 Maintainer: Joshua G. Kenney <joshua.kenney@yale.edu>
 Repository: CRAN
-Date/Publication: 2026-02-03 23:00:02 UTC
+Date/Publication: 2026-03-04 19:50:03 UTC
