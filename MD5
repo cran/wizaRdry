@@ -1,4 +1,4 @@
-d33cdefcd5ffd29369a0e4548e0e4bcb *DESCRIPTION
+b24094cfc17680c340ada518b52855c8 *DESCRIPTION
 b4e6a4f17c35fb17e9a3c8c9600e8c84 *LICENSE
 48c4559b717d7e170190ad90f25d5f11 *NAMESPACE
 1d1b488527c3eb0b7db068d44ecc9156 *NEWS.md
@@ -23,8 +23,8 @@ ab026992ed10c25f88bc9d23b79d700c *R/cleanDataFrameExists.R
 d33e8c2227f7c43387664f944e149f45 *R/createCsv.R
 2d2476d17e8a14f44871d7c3ea034864 *R/createExtract.R
 724725b3b2bb5628735e3fa2259ed2aa *R/createNda.R
-32126cc066a67b831c0753268f135791 *R/createNdaDataDefinition.R
-d183dd1be9ac7a334066192ecb26500e *R/createNdaSubmissionTemplate.R
+24faeb972b233bef787f954f588fca5a *R/createNdaDataDefinition.R
+3031f30d90a5438dafc25fc942a8cdee *R/createNdaSubmissionTemplate.R
 fb52d4b7bf76b10d1b09245171076c32 *R/createRda.R
 27cb1dc85a58ebe485ba8b90f9dbd306 *R/createSpss.R
 efaf9ded058f8ade8e78649dff3b3927 *R/dataFilter.R
@@ -36,14 +36,14 @@ df6cc46bc7fae1a55b713f3d5065b35a *R/dataWizardry-package.R
 9da5cbc443c67a058faaa863721eca32 *R/getMongo.R
 651721b70c8bf5c2719ad440bf42c662 *R/getOracle.R
 9faa53a998970b6ff9ff2a27f31548d5 *R/getQualtrics.R
-ca1883cdb4747a970fda3f4ea85f6808 *R/getRedcap.R
+0a714fd02a54dc9657b6ff252ca66059 *R/getRedcap.R
 783cc26aa9914c878758ec78b278441a *R/getSql.R
-3c6b2798f8edbfc97177bd0f31ec0ec6 *R/globals.R
+665a2bf50dd2ca6bb97c89f197fdfb54 *R/globals.R
 911220b7af92da12b1e8c56f3f1be53a *R/ndaCheckQualtricsDuplicates.R
 a6bfa0228298cfc9ff311297ff9f3b9f *R/ndaFieldMapping.R
-0a7a9452ab0dda522acec1afc132db37 *R/ndaFieldRenaming.R
-15f827580c5f3b4325590139896267e0 *R/ndaFieldSelection.R
-a5d6ce0f5fa2049823203857f3b7be63 *R/ndaFileCreation.R
+8bd0c4a5f4a9a78852d2107413889d8c *R/ndaFieldRenaming.R
+bf4d93b54e65cf5bc6e7d86cc22f362d *R/ndaFieldSelection.R
+376c271a5dfbac676e830a41f8d8341e *R/ndaFileCreation.R
 2b7cadcf45872a8978412bdfa264f73b *R/ndaRequest.R
 3fd732fce4fa2e3167dca25e5bd0278d *R/ndaRequiredVariablesExist.R
 470f1b8ed44edb9c62daaa7d8eb4aa11 *R/ndaTransformations.R
@@ -53,7 +53,7 @@ e7d17d1b3a92f0398ff07a0e25f7fdc5 *R/processCaprData.R
 9423d27d5a64e798703002b7c0f61805 *R/scry.R
 3ff3177c3d4acfe283dd11776c4f54ea *R/secrets.R
 a893259ac50bee0c7c5fc8589e54116b *R/testSuite.R
-a0e1b26d4ead45108fb48927cb760989 *R/zzz.R
+1843c8f5fbdec9cbf12c5a5b22bbbaf8 *R/zzz.R
 76161b65639451c966be75488458b3c3 *build/partial.rdb
 5d246547e4ea430cff38cc81c8b6ee95 *inst/WORDLIST
 c350ba0ed6d02c90d6868ae7b9ee435d *man/DataEnvironment.Rd
