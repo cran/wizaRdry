@@ -1,6 +1,6 @@
-b24094cfc17680c340ada518b52855c8 *DESCRIPTION
+5c638b6003cfe572135b81ac92de350b *DESCRIPTION
 b4e6a4f17c35fb17e9a3c8c9600e8c84 *LICENSE
-48c4559b717d7e170190ad90f25d5f11 *NAMESPACE
+57661c7373805c94996aacf6de9d2167 *NAMESPACE
 1d1b488527c3eb0b7db068d44ecc9156 *NEWS.md
 7409b233b386d6cbc9893094189a8d2d *R/CategoricalVariables.R
 f516b51fc67c1b2a3541c6c8cf8eba1f *R/ConfigEnv.R
@@ -41,12 +41,12 @@ df6cc46bc7fae1a55b713f3d5065b35a *R/dataWizardry-package.R
 665a2bf50dd2ca6bb97c89f197fdfb54 *R/globals.R
 911220b7af92da12b1e8c56f3f1be53a *R/ndaCheckQualtricsDuplicates.R
 a6bfa0228298cfc9ff311297ff9f3b9f *R/ndaFieldMapping.R
-8bd0c4a5f4a9a78852d2107413889d8c *R/ndaFieldRenaming.R
+5068ecceb24bb3f7c3ad8d5381cd4582 *R/ndaFieldRenaming.R
 bf4d93b54e65cf5bc6e7d86cc22f362d *R/ndaFieldSelection.R
 376c271a5dfbac676e830a41f8d8341e *R/ndaFileCreation.R
-2b7cadcf45872a8978412bdfa264f73b *R/ndaRequest.R
+90a50be240a46e9a310005f19967f0f8 *R/ndaRequest.R
 3fd732fce4fa2e3167dca25e5bd0278d *R/ndaRequiredVariablesExist.R
-470f1b8ed44edb9c62daaa7d8eb4aa11 *R/ndaTransformations.R
+0259d7add86ddd1e5c49d2050494c5ae *R/ndaTransformations.R
 5e23a1c00218b58d6dbb3f2932c68641 *R/ndaValidationHelpers.R
 38d7427a696eb3d896690b063870739a *R/ndaValidator.R
 e7d17d1b3a92f0398ff07a0e25f7fdc5 *R/processCaprData.R
