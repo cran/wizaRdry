@@ -1,7 +1,7 @@
 Package: wizaRdry
 Title: A Magical Framework for Collaborative & Reproducible Data
         Analysis
-Version: 0.6.8
+Version: 0.6.16
 Authors@R: c(
     person("Joshua G.", "Kenney", email = "joshua.kenney@yale.edu", role = c("aut", "cre")),
     person("Trevor F.", "Williams", email = "trevormsu@gmail.com", role = "aut"),
@@ -26,7 +26,7 @@ URL: https://github.com/belieflab/wizaRdry
 BugReports: https://github.com/belieflab/wizaRdry/issues
 Suggests: rmarkdown, yaml
 NeedsCompilation: no
-Packaged: 2026-05-12 19:24:57 UTC; Joshua
+Packaged: 2026-06-10 15:22:09 UTC; Joshua
 Author: Joshua G. Kenney [aut, cre],
   Trevor F. Williams [aut],
   Minerva K. Pappu [aut],
@@ -38,4 +38,4 @@ Author: Joshua G. Kenney [aut, cre],
   Christian R. Horgan [ctb]
 Maintainer: Joshua G. Kenney <joshua.kenney@yale.edu>
 Repository: CRAN
-Date/Publication: 2026-05-12 20:00:02 UTC
+Date/Publication: 2026-06-10 16:40:02 UTC

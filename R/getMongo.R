@@ -145,11 +145,14 @@ calculateResourceParams <- function(total_records, mem_info, num_cores) {
 
   # Adjust for very small datasets
   if (total_records < params$chunk_size * 2) {
-    params$chunk_size <- max(500, floor(total_records / 2))
+    params$chunk_size <- max(1, floor(total_records / 2))
   }
 
   # Calculate resulting chunks
-  params$num_chunks <- ceiling(total_records / params$chunk_size)
+  params$num_chunks <- max(1, ceiling(total_records / params$chunk_size))
+
+  # Never spin up more workers than there are chunks
+  params$workers <- min(params$workers, params$num_chunks)
 
   return(params)
 }
@@ -212,19 +215,41 @@ formatDuration <- function(duration) {
   }
 }
 
-#' Create consistent chunks using unique IDs instead of skip/limit
+#' Fetch all unique identifier values from a collection (single distinct scan)
 #' @param Mongo MongoDB connection object
 #' @param identifier Field to use as identifier
-#' @param chunk_size Number of records per chunk
-#' @return List containing chunks with specific IDs and total record count
+#' @return Atomic vector of unique identifier values
 #' @noRd
-createConsistentChunks <- function(Mongo, identifier, chunk_size) {
+fetchAllIds <- function(Mongo, identifier) {
   message("Getting unique identifiers for consistent chunking...")
 
   # Get ALL unique identifiers first (eliminates skip/limit issues)
   all_ids <- Mongo$distinct(identifier,
                             query = sprintf('{"%s": {"$exists": true, "$ne": ""}}', identifier))
 
+  # distinct() returns an atomic vector for string/numeric identifiers but a
+  # list for binary BSON types (UUID, ObjectId, Binary). Those cannot be
+  # round-tripped into a valid $in query via toJSON, so chunked retrieval
+  # would silently return zero rows. Fail fast with an actionable message.
+  if (length(all_ids) > 0 && !is.atomic(all_ids)) {
+    stop(sprintf(
+      paste0("Identifier '%s' is stored as a non-string BSON type (e.g. UUID, ObjectId, ",
+             "or Binary). Chunked MongoDB retrieval requires a string or numeric ",
+             "identifier. Set `identifier` to a string field in config.yml or pass ",
+             "identifier= explicitly when calling mongo()."),
+      identifier
+    ), call. = FALSE)
+  }
+
+  all_ids
+}
+
+#' Partition an in-memory id vector into chunks (no DB access)
+#' @param all_ids Atomic vector of unique identifier values
+#' @param chunk_size Number of records per chunk
+#' @return List containing chunks with specific IDs and total record count
+#' @noRd
+chunkIds <- function(all_ids, chunk_size) {
   total_records <- length(all_ids)
   num_chunks <- ceiling(total_records / chunk_size)
 
@@ -239,7 +264,17 @@ createConsistentChunks <- function(Mongo, identifier, chunk_size) {
     )
   }
 
-  return(list(chunks = chunks, total_records = total_records))
+  list(chunks = chunks, total_records = total_records)
+}
+
+#' Create consistent chunks using unique IDs instead of skip/limit
+#' @param Mongo MongoDB connection object
+#' @param identifier Field to use as identifier
+#' @param chunk_size Number of records per chunk
+#' @return List containing chunks with specific IDs and total record count
+#' @noRd
+createConsistentChunks <- function(Mongo, identifier, chunk_size) {
+  chunkIds(fetchAllIds(Mongo, identifier), chunk_size)
 }
 
 #' Retrieve MongoDB data using $in queries for consistency
@@ -276,13 +311,28 @@ getMongoDataConsistent <- function(Mongo, identifier, chunk_info, verbose = FALS
 validateResults <- function(df, identifier) {
   if (nrow(df) == 0) return(TRUE)
 
+  # Columns that imply repeated rows per subject are intentional
+  multi_obs_cols <- c("trial", "trial_index", "index", "visit", "week",
+                      "timepoint", "session", "run", "block", "event")
+
+  if (any(multi_obs_cols %in% names(df))) {
+    # Multi-observation data: duplicates are expected — check for true duplicates
+    # (fully identical rows) instead
+    true_dupes <- sum(duplicated(df))
+    if (true_dupes > 0) {
+      warning(sprintf("Found %d fully duplicate rows (identical across all columns)", true_dupes))
+      return(FALSE)
+    }
+    return(TRUE)
+  }
+
+  # Subject-level data: each identifier should appear exactly once
   duplicates <- sum(duplicated(df[[identifier]]))
   if (duplicates > 0) {
     warning(sprintf("Found %d duplicate records for identifier %s", duplicates, identifier))
     return(FALSE)
   }
 
-  message(sprintf("Validation passed: %d unique records", nrow(df)))
   return(TRUE)
 }
 
@@ -331,34 +381,20 @@ mongo <- function(collection, ..., database = NULL, identifier = NULL, chunk_siz
   # Get configuration
   cfg <- validate_config("mongo")
   if (is.null(database)) {
-    database <- cfg$mongo$collection
+    database <- cfg$mongo$database
   }
 
   # Validate identifier
   if (is.null(identifier)) {
     identifier <- cfg$identifier
   }
-  if (is.null(identifier) || any(identifier == "")) {
-    stop("No identifier specified in the config file.")
+  if (is.null(identifier) || !is.character(identifier) || any(identifier == "")) {
+    stop("No identifier specified. Set `identifier` in config.yml or pass identifier= to mongo().",
+         call. = FALSE)
   }
 
-  # Try connecting - will now throw explicit error if collection doesn't exist
+  # Try connecting - throws an explicit error if the collection does not exist
   Mongo <- ConnectMongo(collection, database)
-
-  # Find valid identifier
-  if (is.null(identifier)) {
-    for (key in trimws(strsplit(identifier, ",")[[1]])) {
-      count <- Mongo$count(sprintf('{"$s": {"$exists": true, "$ne": ""}}', key))
-      if (count > 0) {
-        identifier <- key
-        break
-      }
-    }
-  }
-
-  if (is.null(identifier)) {
-    stop("No valid identifier found in the collection.")
-  }
 
   # Get and display system resources
   mem_info <- getAvailableMemory()
@@ -376,32 +412,32 @@ mongo <- function(collection, ..., database = NULL, identifier = NULL, chunk_siz
     message(sprintf("Memory available: %.0fGB RAM", mem_info$available))
   }
 
-  # NEW: Use consistent chunking instead of skip/limit
-  chunk_result <- createConsistentChunks(Mongo, identifier,
-                                         if(is.null(chunk_size)) 1000 else chunk_size)
-  chunks <- chunk_result$chunks
-  total_records <- chunk_result$total_records  # Use actual count from distinct()
+  # Single distinct() scan, then size chunks from the in-memory id vector
+  all_ids <- fetchAllIds(Mongo, identifier)
+  total_records <- length(all_ids)
 
   # Calculate optimal parameters with the new optimizations
   params <- calculateResourceParams(total_records, mem_info, num_cores)
 
-  # Use optimized chunk size if not manually specified
-  if (is.null(chunk_size)) {
-    # Recreate chunks with optimized size
-    chunk_result <- createConsistentChunks(Mongo, identifier, params$chunk_size)
-    chunks <- chunk_result$chunks
-  }
+  chunk_sz <- if (is.null(chunk_size)) params$chunk_size else chunk_size
+  chunk_result <- chunkIds(all_ids, chunk_sz)
+  chunks <- chunk_result$chunks
 
-  message(sprintf("Processing: %d chunks x ~%d records in parallel (%d workers)",
-                  length(chunks), params$chunk_size, params$workers))
+  message(sprintf("Processing: %d chunks x ~%d %s in parallel (%d workers)",
+                  length(chunks), params$chunk_size, identifier, params$workers))
 
-  # Setup parallel processing with optimized worker count
+  # Setup parallel processing with optimized worker count, restoring the
+  # caller's existing future plan when mongo() returns
+  old_plan <- future::plan()
+  on.exit(future::plan(old_plan), add = TRUE)
   plan(future::multisession, workers = params$workers)
 
-  # Progress message
-  message(sprintf("\nImporting %s records from %s/%s into dataframe...",
+  # Progress message (total_records is the count of distinct identifier
+  # values, not documents - the result may contain more rows than this)
+  message(sprintf("\nImporting %s/%s (%s unique %s) into dataframe...",
+                  database, collection,
                   formatC(total_records, format = "d", big.mark = ","),
-                  database, collection))
+                  identifier))
 
   # Initialize custom progress bar
   pb <- initializeLoadingAnimation(length(chunks))
@@ -420,28 +456,51 @@ mongo <- function(collection, ..., database = NULL, identifier = NULL, chunk_siz
       })
 
       tryCatch({
-        chunk_mongo <- ConnectMongo(collection, database)
-        # Use NEW consistent retrieval method
-        data_chunk <- getMongoDataConsistent(chunk_mongo, identifier, chunks[[i]], verbose)
-        data_chunk
+        # Existence already validated once in the main process; skip the
+        # per-chunk listCollections probe
+        chunk_mongo <- connectMongoRaw(collection, database)
+        getMongoDataConsistent(chunk_mongo, identifier, chunks[[i]], verbose)
       }, error = function(e) {
-        warning(sprintf("Error processing chunk %d: %s", i, e$message))
-        NULL
+        # Return a structured marker instead of NULL so the parent process can
+        # report the real failure rather than silently yielding an empty frame
+        structure(list(chunk = i, message = conditionMessage(e)),
+                  class = "mongo_chunk_error")
       })
     })
     updateLoadingAnimation(pb, i)
   }
 
   # Collect results
-  # results <- lapply(future_results, future::value)
-  # Recommended new syntax by Futureverse maintainer
   results <- value(future_results)
+  completeLoadingAnimation(pb)
+
+  # Surface any chunk-level failures instead of silently dropping them
+  is_chunk_error <- vapply(results, inherits, logical(1), what = "mongo_chunk_error")
+  if (any(is_chunk_error)) {
+    err_msgs <- vapply(results[is_chunk_error], function(e) {
+      sprintf("  - chunk %d: %s", e$chunk, e$message)
+    }, character(1))
+    if (all(is_chunk_error)) {
+      stop(sprintf("All %d MongoDB chunk(s) failed to retrieve from %s/%s:\n%s",
+                   length(results), database, collection,
+                   paste(err_msgs, collapse = "\n")), call. = FALSE)
+    }
+    warning(sprintf("%d of %d MongoDB chunk(s) failed and were skipped:\n%s",
+                    sum(is_chunk_error), length(results),
+                    paste(err_msgs, collapse = "\n")), call. = FALSE)
+    results <- results[!is_chunk_error]
+  }
 
   # Combine results
   df <- dplyr::bind_rows(results)
-  completeLoadingAnimation(pb)
 
-  # NEW: Validate results for consistency
+  if (nrow(df) == 0) {
+    warning(sprintf(paste0("No records retrieved from %s/%s. The collection may be empty ",
+                           "or identifier '%s' may not match any documents."),
+                    database, collection, identifier), call. = FALSE)
+  }
+
+  # Validate results for consistency
   validation_passed <- validateResults(df, identifier)
   if (!validation_passed) {
     warning("Data consistency validation failed. Results may contain duplicates.")
@@ -577,45 +636,88 @@ mongo <- function(collection, ..., database = NULL, identifier = NULL, chunk_siz
 ## Helper Functions
 ## ################
 
-#' Setup MongoDB connection with suppressed messages
-#' @param collection The name of the collection you want to connect to.
-#' @param database The name of the database you cant to connect to.
-#' @return A mongolite::mongo object representing the connection to the MongoDB collection.
+#' Standard SSL options for MongoDB/DocumentDB connections
+#' NOTE: `key=` is the client private-key slot, but rds-combined-ca-bundle.pem
+#' is a CA bundle - it likely belongs in `ca=`. Flagged as a separate
+#' follow-up; behavior intentionally left unchanged here.
 #' @noRd
-ConnectMongo <- function(collection, database) {
-  # Validate secrets
+mongoSslOptions <- function() {
+  ssl_options(weak_cert_validation = TRUE, key = "rds-combined-ca-bundle.pem")
+}
+
+#' Run an expression with stdout sunk to a throwaway tempfile
+#' Used to swallow noisy mongolite/driver output. Restores the output stream
+#' and removes the tempfile even if `expr` errors.
+#' @param expr Expression to evaluate with output suppressed
+#' @return The value of `expr`
+#' @noRd
+with_suppressed_output <- function(expr) {
+  temp <- tempfile()
+  sink(temp, type = "output")
+  on.exit({
+    sink(type = "output")
+    unlink(temp)
+  }, add = TRUE)
+  force(expr)
+}
+
+#' Open a MongoDB connection without the collection-existence probe
+#'
+#' Validates secrets/config and returns a live connection. Skips the
+#' listCollections round-trip done by [ConnectMongo()]; use this on hot paths
+#' (e.g. per-chunk in parallel workers) where existence was already verified
+#' once in the main process.
+#' @param collection Collection to connect to.
+#' @param database Database name; resolved from config when NULL.
+#' @return A mongolite::mongo connection object.
+#' @noRd
+connectMongoRaw <- function(collection, database) {
   validate_secrets("mongo")
   config <- validate_config("mongo")
-
-  # Get secrets using get_secret() to keep it secret, keep it safe
   connectionString <- get_secret("connectionString")
 
   if (is.null(database)) {
-    database = config$mongo$database
+    database <- config$mongo$database
   }
 
-  options <- ssl_options(weak_cert_validation = TRUE, key = "rds-combined-ca-bundle.pem")
-
-  # The key is to use sink() to capture and discard the messages
-  temp <- tempfile()
-  sink(temp)
-
-  # Create connection without specifying collection first
-  base_connection <- mongolite::mongo(
-    collection = collection, # This is a system collection that always exists
-    db = database,
-    url = connectionString,
-    verbose = FALSE,
-    options = options
+  with_suppressed_output(
+    mongolite::mongo(
+      collection = collection,
+      db = database,
+      url = connectionString,
+      verbose = FALSE,
+      options = mongoSslOptions()
+    )
   )
+}
 
-  # Check if the collection exists
-  collections_list <- getCollectionsFromConnection(base_connection)
+#' Setup MongoDB connection, validating that the collection exists
+#' @param collection The name of the collection you want to connect to.
+#' @param database The name of the database you want to connect to.
+#' @return A mongolite::mongo object representing the connection to the MongoDB collection.
+#' @noRd
+ConnectMongo <- function(collection, database) {
+  validate_secrets("mongo")
+  config <- validate_config("mongo")
+  connectionString <- get_secret("connectionString")
 
-  # Close the base connection
-  base_connection$disconnect()
-  sink()
-  unlink(temp)
+  if (is.null(database)) {
+    database <- config$mongo$database
+  }
+
+  # Probe for the collection list with driver output suppressed
+  collections_list <- with_suppressed_output({
+    base_connection <- mongolite::mongo(
+      collection = collection,
+      db = database,
+      url = connectionString,
+      verbose = FALSE,
+      options = mongoSslOptions()
+    )
+    cl <- getCollectionsFromConnection(base_connection)
+    base_connection$disconnect()
+    cl
+  })
 
   # Validate that collection exists
   if (!collection %in% collections_list) {
@@ -623,22 +725,8 @@ ConnectMongo <- function(collection, database) {
                  collection, database, paste(collections_list, collapse=", ")))
   }
 
-  # If we get here, the collection exists - create normal connection
-  sink(temp)
-  on.exit({
-    sink()
-    unlink(temp)
-  })
-
-  Mongo <- mongolite::mongo(
-    collection = collection,
-    db = database,
-    url = connectionString,
-    verbose = FALSE,
-    options = options
-  )
-
-  return(Mongo)
+  # Existence verified - hand off to the lightweight connector
+  connectMongoRaw(collection, database)
 }
 
 #' Safely close MongoDB connection
@@ -699,11 +787,12 @@ getCollectionsFromConnection <- function(mongo_connection) {
 #' @importFrom stats setNames
 #' @noRd
 taskHarmonization <- function(df, identifier, collection) {
+  if (nrow(df) == 0) return(df)
   # Ensure 'visit' column exists and update it as necessary
   if (!("visit" %in% colnames(df))) {
-    df$visit <- "bl"  # Add 'visit' column with all values as "bl" if it doesn't exist
+    df$visit <- rep("bl", nrow(df))
   } else {
-    df$visit <- ifelse(is.na(df$visit) | df$visit == "", "bl", df$visit)  # Replace empty or NA 'visit' values with "bl"
+    df$visit <- ifelse(is.na(df$visit) | df$visit == "", "bl", df$visit)
   }
 
   # convert dates (from string ("m/d/Y") to iso date format)
@@ -718,12 +807,14 @@ taskHarmonization <- function(df, identifier, collection) {
 #'
 #'
 #' Retrieves a list of all available collections in the configured MongoDB database.
+#' @param pattern Optional regex string; if supplied, only collections whose
+#'   name matches (case-insensitive) are shown.
 #' @param database Optional; the name of the database to connect to. If NULL, uses the database
 #'   specified in the configuration file.
 #' @return A character vector containing the names of all available collections
 #'   in the configured MongoDB database.
 #' @export
-mongo.index <- function(database = NULL) {
+mongo.index <- function(pattern = NULL, database = NULL) {
   # Temporarily suppress warnings
   old_warn <- options("warn")
 
@@ -766,11 +857,7 @@ mongo.index <- function(database = NULL) {
     database = config$mongo$database
   }
 
-  options <- ssl_options(weak_cert_validation = TRUE, key = "rds-combined-ca-bundle.pem")
-
-  # Create a temporary sink to capture MongoDB connection messages
-  temp <- tempfile()
-  sink(temp)
+  options <- mongoSslOptions()
   result <- NULL
 
   # Detect database type to handle warnings appropriately
@@ -779,38 +866,38 @@ mongo.index <- function(database = NULL) {
 
   # Create a direct connection to the database without specifying a collection
   tryCatch({
-    # Use suppressSpecificWarning to handle the endSessions warning
-    suppressSpecificWarning({
-      # Connect directly to the database, not a specific collection
-      base_connection <- mongolite::mongo(
-        collection = "system.namespaces", # This is a system collection that always exists
-        db = database,
-        url = connectionString,
-        verbose = FALSE,
-        options = options
-      )
-
-      # Get the list of collections
-      collections <- base_connection$run('{"listCollections":1,"nameOnly":true}')
-      result <- collections$cursor$firstBatch$name
-
-      # Try to disconnect with warning suppression
+    result <- with_suppressed_output({
+      # Use suppressSpecificWarning to handle the endSessions warning
       suppressSpecificWarning({
-        base_connection$disconnect()
+        # Connect directly to the database, not a specific collection
+        base_connection <- mongolite::mongo(
+          collection = "system.namespaces", # system collection that always exists
+          db = database,
+          url = connectionString,
+          verbose = FALSE,
+          options = options
+        )
+
+        # Get the list of collections
+        collections <- base_connection$run('{"listCollections":1,"nameOnly":true}')
+        res <- collections$cursor$firstBatch$name
+
+        # Try to disconnect with warning suppression
+        suppressSpecificWarning({
+          base_connection$disconnect()
+        }, "endSessions")
+
+        # Force garbage collection to clean up any lingering connections
+        rm(base_connection)
+        invisible(gc(verbose = FALSE))
+        res
       }, "endSessions")
-
-      # Force garbage collection to clean up any lingering connections
-      rm(base_connection)
-      invisible(gc(verbose = FALSE))
-    }, "endSessions")
-
-    # Additional suppression for any remaining warnings
-    suppressWarnings({
-      # This should catch any warnings that slip through
     })
 
-    sink()
-    unlink(temp)
+    # Apply optional grep-style filter
+    if (!is.null(pattern)) {
+      result <- result[index_grep(result, pattern)]
+    }
 
     # Display collections in a nice format
     if (length(result) > 0) {
@@ -831,6 +918,8 @@ mongo.index <- function(database = NULL) {
 
       message("")
       message(sprintf("Total: %d collections", length(result)))
+    } else if (!is.null(pattern)) {
+      message(sprintf("No collections matching '%s' in the database.", pattern))
     } else {
       message("No collections found in the database.")
     }
@@ -840,8 +929,6 @@ mongo.index <- function(database = NULL) {
     invisible(result)  # Use invisible() to prevent console printing
 
   }, error = function(e) {
-    sink()
-    unlink(temp)
     # Restore previous warning setting before stopping
     options(old_warn)
     stop(paste("Error connecting to MongoDB:", e$message))

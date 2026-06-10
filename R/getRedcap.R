@@ -348,7 +348,8 @@ redcap <- function(instrument_name = NULL, ..., raw_or_label = "raw",
     records = records,
     events = redcap_event_name,  # Filter by event names if specified
     fields = selected_fields,
-    raw_or_label = raw_or_label,  # Use user's preference
+    raw_or_label = if (!is.null(config$redcap$superkey) &&
+                        identical(instrument_name, config$redcap$superkey)) "label" else raw_or_label,
     raw_or_label_headers = "raw",
     verbose = FALSE
   )
@@ -367,10 +368,45 @@ redcap <- function(instrument_name = NULL, ..., raw_or_label = "raw",
     super_key_cols <- setdiff(super_key_cols, pii_fields)
   }
 
-  # If the requested instrument IS the superkey, return it directly without joins/propagation
+  # If the requested instrument IS the superkey, consolidate across all events.
+  # Using superkey_response (no event filter) ensures fields filled in any event are captured.
+  # If redcap_event_name was specified, restrict to subjects present in that event afterward.
   if (is_superkey_request) {
-    message("Requested instrument matches configured superkey; returning without joins or propagation.")
-    df <- instrument_response$data
+    primary_key_col <- config$redcap$primary_key
+    if ("redcap_event_name" %in% names(superkey_response$data)) {
+      subjects <- unique(superkey_response$data[[primary_key_col]])
+      all_cols <- setdiff(names(superkey_response$data), "redcap_event_name")
+      df <- do.call(rbind, lapply(subjects, function(sid) {
+        rows <- superkey_response$data[superkey_response$data[[primary_key_col]] == sid,
+                                       all_cols, drop = FALSE]
+        result <- rows[1, , drop = FALSE]
+        rownames(result) <- NULL
+        for (col in all_cols) {
+          vals <- rows[[col]][!is.na(rows[[col]])]
+          if (length(vals) > 0) result[[col]] <- vals[1]
+        }
+        result
+      }))
+    } else {
+      df <- superkey_response$data
+    }
+    if (!is.null(redcap_event_name) && "redcap_event_name" %in% names(superkey_response$data)) {
+      event_subjects <- unique(
+        superkey_response$data[
+          superkey_response$data$redcap_event_name %in% redcap_event_name,
+          primary_key_col
+        ]
+      )
+      if (length(event_subjects) > 0) {
+        df <- df[df[[primary_key_col]] %in% event_subjects, , drop = FALSE]
+      } else {
+        message(sprintf(
+          "No records found in event(s) '%s' -- returning all consolidated subjects.",
+          paste(redcap_event_name, collapse = ", ")
+        ))
+      }
+    }
+    message("Requested instrument matches configured superkey; returning consolidated data.")
   } else if ("redcap_event_name" %in% names(superkey_response$data)) {
     # First, ensure the primary key exists in the superkey data
     if (!(config$redcap$primary_key %in% names(superkey_response$data))) {
@@ -818,11 +854,13 @@ redcap <- function(instrument_name = NULL, ..., raw_or_label = "raw",
 #'
 #' Retrieves a list of all available REDCap forms as a formatted table
 #'
+#' @param pattern Optional regex string; if supplied, only instruments whose
+#'   name or label matches (case-insensitive) are shown.
 #' @return A formatted table (kable) of available REDCap instruments/forms
 #' @importFrom REDCapR redcap_instruments
 #' @importFrom knitr kable
 #' @export
-redcap.index <- function() {
+redcap.index <- function(pattern = NULL) {
   # Load required packages
 
   # Validate secrets
@@ -844,7 +882,17 @@ redcap.index <- function() {
 
     # Check if the operation was successful
     if (forms_result$success) {
-      return(knitr::kable(forms_result$data, format = "simple"))
+      forms <- forms_result$data
+      if (!is.null(pattern)) {
+        nm <- if ("instrument_name" %in% names(forms)) forms$instrument_name else forms[[1]]
+        lbl <- if ("instrument_label" %in% names(forms)) forms$instrument_label else nm
+        forms <- forms[index_grep(nm, pattern) | index_grep(lbl, pattern), ]
+        if (nrow(forms) == 0) {
+          message(sprintf("No REDCap instruments matching '%s'.", pattern))
+          return(NULL)
+        }
+      }
+      return(knitr::kable(forms, format = "simple"))
     } else {
       message("REDCap API returned an error: ", forms_result$status_message)
       return(NULL)

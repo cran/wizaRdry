@@ -89,12 +89,17 @@ ndaValidator <- function(measure_name,
     # ============================================================================
     if (verbose) message("\n--- PHASE 1: Data Cleaning ---")
     
+    # Convert array fields (list columns / bracket-notation strings) to NDA codes.
+    # Must run before convert_problematic_column_types so list structure is intact.
+    df <- convert_array_fields(df, elements, verbose = verbose)
+    state$set_df(df)
+
     # Convert problematic column types
     df <- convert_problematic_column_types(df, measure_name, verbose)
     state$set_df(df)
-    
-    # Convert logical columns to character
-    df <- convert_logical_to_character(df, verbose)
+
+    # Convert logical/boolean-string columns to integer (NDA requires 0/1, not TRUE/FALSE)
+    df <- convert_logical_to_integer(df, verbose)
     state$set_df(df)
     
     # ============================================================================
@@ -197,48 +202,57 @@ ndaValidator <- function(measure_name,
     }
     
     if (verbose) message("\n--- PHASE 3: Required Field Data Validation ---")
-    
-    # Check field data completeness (only validates 5 super required fields)
+
+    # ndar_subject01 defines interview_age/interview_date for other structures;
+    # they are not per-record requirements when submitting ndar_subject01 itself.
+    effective_super_required <- if (measure_name == "ndar_subject01") {
+      SUPER_REQUIRED_FIELDS[!SUPER_REQUIRED_FIELDS %in% NDAR_SUBJECT01_EXEMPT_FIELDS]
+    } else {
+      SUPER_REQUIRED_FIELDS
+    }
+
+    # Check field data completeness (only validates super required fields)
     data_violations <- check_field_data_completeness(
-      state, 
-      elements, 
-      super_required_fields = SUPER_REQUIRED_FIELDS,
-      strict = strict, 
+      state,
+      elements,
+      super_required_fields = effective_super_required,
+      strict = strict,
       verbose = verbose
     )
     required_violations <- data_violations$required
     recommended_violations <- data_violations$recommended
     
-    # Handle violations based on strict mode
-    has_violations <- length(required_violations) > 0 || length(recommended_violations) > 0
-    
+    # Recommended violations are advisory only — never block the pipeline
+    if (length(recommended_violations) > 0) {
+      for (field_name in names(recommended_violations)) {
+        state$warnings <- c(state$warnings,
+                           sprintf("Recommended field '%s': All values are NA (optional field)",
+                                  field_name))
+      }
+    }
+
+    # Handle violations based on strict mode — only REQUIRED violations block the pipeline
+    has_violations <- length(required_violations) > 0
+
     if (has_violations) {
-      # BOTH strict and lenient: Mark as invalid and store violations
+      # Mark as invalid and store required violations
       state$is_valid <- FALSE
-      
-      # Store violations in state (same for both modes)
+
       for (field_name in names(required_violations)) {
-        state$errors <- c(state$errors, 
-                         sprintf("Required field '%s': %s", 
-                                field_name, 
+        state$errors <- c(state$errors,
+                         sprintf("Required field '%s': %s",
+                                field_name,
                                 required_violations[[field_name]]$issue))
       }
-      
-      for (field_name in names(recommended_violations)) {
-        state$errors <- c(state$errors,
-                         sprintf("Recommended field '%s': %s",
-                                field_name,
-                                recommended_violations[[field_name]]$issue))
-      }
-      
+
       if (strict) {
         # STRICT MODE: Stop processing, skip remaining phases
-        
+
         # Non-verbose output
         if (!verbose) {
           message("")  # Blank line
           message("[ERROR] Field validation failed:\n")
-          
+
           if (length(required_violations) > 0) {
             message("  Required Fields:")
             for (field_name in names(required_violations)) {
@@ -247,22 +261,13 @@ ndaValidator <- function(measure_name,
             }
             message("")
           }
-          
-          if (length(recommended_violations) > 0) {
-            message("  Recommended Fields (strict mode):")
-            for (field_name in names(recommended_violations)) {
-              violation <- recommended_violations[[field_name]]
-              message(sprintf("    - %s: %s", field_name, violation$issue))
-            }
-            message("")
-          }
-          
-          total_violations <- length(required_violations) + length(recommended_violations)
+
+          total_violations <- length(required_violations)
           message(sprintf("[ERROR] Validation failed with %d field violation%s",
                          total_violations,
                          if (total_violations > 1) "s" else ""))
           message("")  # Blank line
-          
+
           # Skip remaining phases
           message("\n=== STEP 3: De-identifying Data ===")
           message("[SKIPPED - Validation failed]")
@@ -271,20 +276,20 @@ ndaValidator <- function(measure_name,
           message("[SKIPPED - Validation failed]")
           message("")
         }
-        
+
         # Return early with failed state
         return(state)
-        
+
       } else {
         # LENIENT MODE: Show warnings but continue processing
-        state$warnings <- c(state$warnings, 
-                           sprintf("Found %d field(s) with missing data", 
-                                  length(required_violations) + length(recommended_violations)))
-        
+        state$warnings <- c(state$warnings,
+                           sprintf("Found %d required field(s) with missing data",
+                                  length(required_violations)))
+
         if (!verbose) {
           message("")  # Blank line
           message("[WARN] Field validation failed (lenient mode):\n")
-          
+
           if (length(required_violations) > 0) {
             message("  Required Fields:")
             for (field_name in names(required_violations)) {
@@ -293,17 +298,8 @@ ndaValidator <- function(measure_name,
             }
             message("")
           }
-          
-          if (length(recommended_violations) > 0) {
-            message("  Recommended Fields:")
-            for (field_name in names(recommended_violations)) {
-              violation <- recommended_violations[[field_name]]
-              message(sprintf("    - %s: %s", field_name, violation$issue))
-            }
-            message("")
-          }
-          
-          total_violations <- length(required_violations) + length(recommended_violations)
+
+          total_violations <- length(required_violations)
           message(sprintf("[WARN] Validation failed with %d field violation%s (continuing anyway)",
                          total_violations,
                          if (total_violations > 1) "s" else ""))
@@ -479,8 +475,13 @@ ndaValidator <- function(measure_name,
       message("\n--- PHASE 6: De-identification ---")
     }
     
+    # Always standardize date format to MM/DD/YYYY (required by NDA regardless of pathway)
+    if ("interview_date" %in% names(df)) {
+      df <- standardize_dates(df, verbose = verbose, limited_dataset = limited_dataset)
+    }
+
     if (limited_dataset) {
-      # Limited dataset mode - skip de-identification
+      # Limited dataset mode - date format standardized above, skip age-capping/date-shifting
       if (!verbose) {
         message("[OK] Using limited dataset (de-identification already applied per your configuration)")
         message("")  # Blank line
@@ -488,23 +489,18 @@ ndaValidator <- function(measure_name,
         message("[OK] Limited dataset mode - de-identification already applied")
       }
     } else {
-      # Normal mode - perform de-identification
-      
+      # Normal mode - date-shifting handled by standardize_dates above, also cap age
+
       # Single intro message
       if (!verbose) {
         message("Applying HIPAA Safe Harbor de-identification to limited dataset")
         message("")
       }
-      
-      # Process date-shifting silently
-      if ("interview_date" %in% names(df)) {
-        df <- standardize_dates(df, verbose = verbose, limited_dataset = limited_dataset)
-      }
-      
+
       # Process age-capping silently
       if ("interview_age" %in% names(df)) {
         age_result <- standardize_age(df, verbose = verbose, limited_dataset = limited_dataset)
-        
+
         # Defensive check: ensure age_result is a list with df and stats
         if (is.list(age_result) && "df" %in% names(age_result) && "stats" %in% names(age_result)) {
           df <- age_result$df
@@ -517,14 +513,14 @@ ndaValidator <- function(measure_name,
           age_stats <- NULL
         }
       }
-      
+
       # Show completion messages together
       if (!verbose) {
         message("[OK] Date-shifting complete")
         message("[OK] Age-capping complete")
         message("")  # Blank line after completion
       }
-      
+
       if (verbose) {
         message("\nDataset has been de-identified using date-shifting and age-capping.")
       }

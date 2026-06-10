@@ -149,6 +149,7 @@ check_value_range_violations <- function(state, elements, verbose = FALSE) {
 #' @return Logical
 #' @noRd
 has_data_values <- function(field_values) {
+  if (!is.atomic(field_values)) return(FALSE)
   !all(is.na(field_values)) && length(unique(field_values[!is.na(field_values)])) > 0
 }
 
@@ -157,6 +158,7 @@ has_data_values <- function(field_values) {
 #' @return Character vector of unique values
 #' @noRd
 get_unique_values <- function(field_values) {
+  if (!is.atomic(field_values)) return(character(0))
   unique_vals <- unique(field_values[!is.na(field_values)])
   as.character(sort(unique_vals))
 }
@@ -205,6 +207,8 @@ detect_new_fields <- function(df, elements, dcc = FALSE) {
 #' @return Character vector of violating values
 #' @noRd
 get_violations <- function(value, range_str) {
+  if (!is.atomic(value)) return(character(0))
+  if (is.logical(value)) value <- as.integer(value)
   if (is.null(range_str) || is.na(range_str) || range_str == "") return(character(0))
   
   # First check if there are non-numeric values (when expected numeric)
@@ -284,7 +288,7 @@ get_violations <- function(value, range_str) {
     valid_values <- trimws(strsplit(range_str, ";")[[1]])
     
     # Convert to character for comparison
-    value_char <- as.character(value)
+    value_char <- trimws(as.character(value))
     invalid_mask <- !value_char %in% valid_values
     invalid_mask[is.na(invalid_mask)] <- FALSE
     return(sort(unique(value[invalid_mask])))
@@ -405,7 +409,7 @@ check_field_data_completeness <- function(state, elements, super_required_fields
           
           # Show individual messages only in strict mode OR verbose mode
           if (should_show_validation_message(strict, verbose)) {
-            message(sprintf("[RECOMMENDED FIELD ISSUE] %s: All values are NA", field_name))
+            message(sprintf("[RECOMMENDED FIELD NOTE] %s: All values are NA (optional field)", field_name))
           }
         }
       }
